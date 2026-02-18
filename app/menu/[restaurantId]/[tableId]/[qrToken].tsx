@@ -13,11 +13,12 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
-  View
+  View,
 } from "react-native";
 
-// --- CONFIGURATION ---
-const BASE_URL = "http://127.0.0.1:8000/api";
+// ⚠️ CHANGE THIS TO YOUR IP
+const BASE_URL = "http://192.168.1.32:8000/api";
+
 const THEME = {
   primary: "#FF6B6B",
   secondary: "#2D3436",
@@ -27,93 +28,220 @@ const THEME = {
   textSecondary: "#636E72",
   border: "#EFEFEF",
   success: "#55E6C1",
+  danger: "#FF4757",
+  warning: "#FFA502",
   overlay: "rgba(0,0,0,0.5)",
 };
 
 export default function Menu() {
   const { restaurantId, tableId, qrToken } = useLocalSearchParams();
 
+  // --- STATE ---
   const [customerName, setCustomerName] = useState("");
   const [nameSubmitted, setNameSubmitted] = useState(false);
-  const [menu, setMenu] = useState<any>(null);
-  const [loading, setLoading] = useState(false);
+
   const [sessionToken, setSessionToken] = useState<string | null>(null);
+  const [isPrimary, setIsPrimary] = useState(false);
+  const [joinStatus, setJoinStatus] = useState<
+    "active" | "pending" | "approved" | "rejected" | null
+  >(null);
+
+  const [menu, setMenu] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
   const [cart, setCart] = useState<Record<number, number>>({});
   const [orders, setOrders] = useState<any[]>([]);
 
-  const [selectedOrder, setSelectedOrder] = useState<any>(null);
   const [showTotalBill, setShowTotalBill] = useState(false);
+  const [pendingRequests, setPendingRequests] = useState<any[]>([]);
+  const [showRequestsModal, setShowRequestsModal] = useState(false);
 
-  // --- UPDATED HELPER FOR PRICES ---
-  // Now checks for 'price' OR 'unit_price' to handle both Menu and Order objects
-  const formatPrice = (value: any) => {
-    const num = parseFloat(value);
-    return isNaN(num) ? "0.00" : num.toFixed(2);
+  // --- 1. RESET HELPER ---
+  // --- 1. RESET HELPER (FIXED) ---
+  const clearSession = async () => {
+    try {
+      // 🔥 STEP 1: Tell Backend to Deactivate Session 🔥
+      if (sessionToken) {
+        // "Fire and forget" - we don't need to wait for the result
+        await fetch(`${BASE_URL}/qr/session/leave`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_token: sessionToken }),
+        });
+      }
+    } catch (e) {
+      console.log("Error notifying backend:", e);
+    }
+
+    try {
+      // STEP 2: Clear Local Data
+      const key = `session_${restaurantId}_${tableId}`;
+      await AsyncStorage.removeItem(key);
+
+      // STEP 3: Reset State
+      setSessionToken(null);
+      setCustomerName("");
+      setNameSubmitted(false);
+      setMenu(null);
+      setOrders([]);
+      setIsPrimary(false);
+      setJoinStatus(null);
+      setLoading(false);
+    } catch (e) {
+      console.error(e);
+    }
   };
 
-  // Safe calculation that looks for the correct property
-  const calculateItemTotal = (item: any) => {
-    // Database items use 'unit_price', Menu items use 'price'
-    const price = item.unit_price || item.price || 0;
-    const qty = item.quantity || item.qty || 0;
-    const num = parseFloat(price);
-    return isNaN(num) ? "0.00" : (num * qty).toFixed(2);
-  };
-
-  // --- EFFECTS & LOGIC ---
+  // --- 2. INITIAL LOAD ---
   useEffect(() => {
     if (!restaurantId || !tableId) return;
-    const loadSession = async () => {
+
+    const loadAndValidateSession = async () => {
+      setLoading(true);
+      const key = `session_${restaurantId}_${tableId}`;
+
       try {
+        const stored = await AsyncStorage.getItem(key);
+
+        if (!stored) {
+          setLoading(false);
+          return;
+        }
+
+        const parsed = JSON.parse(stored);
+
+        // Validate session with backend
+        const res = await fetch(
+          `${BASE_URL}/menu/${restaurantId}/${tableId}/${qrToken}?session_token=${parsed.session_token}`,
+        );
+
+        // 🛑 STRICT CHECK: If error code, check if rejected
+        if (!res.ok) {
+          // If it's a 403, it might be pending OR rejected
+          if (res.status === 403) {
+            try {
+              const err = await res.json();
+              if (err.join_status === "rejected") {
+                // IT IS REJECTED. Set state and STOP loading.
+                setJoinStatus("rejected");
+                setNameSubmitted(true);
+                setLoading(false);
+                return;
+              }
+              // If it is 'pending', we allow it to proceed to the "Waiting" screen
+            } catch (e) {
+              await clearSession();
+              return;
+            }
+          } else {
+            // 401 or 404 means dead session -> Clear it
+            await clearSession();
+            return;
+          }
+        }
+
+        const data = await res.json();
+
+        // Restore State
+        setSessionToken(parsed.session_token);
+        setCustomerName(parsed.customer_name);
+
+        if (data.session) {
+          setIsPrimary(data.session.is_primary);
+          setJoinStatus(data.session.join_status);
+        } else {
+          setIsPrimary(parsed.is_primary || false);
+          setJoinStatus(parsed.join_status);
+        }
+
+        setNameSubmitted(true);
+
+        if (
+          res.ok &&
+          (data.session?.join_status === "approved" || data.session?.is_primary)
+        ) {
+          setMenu(data);
+          fetchOrders(parsed.session_token);
+        }
+      } catch (e) {
+        await clearSession();
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    loadAndValidateSession();
+  }, []);
+
+  // --- 3. POLLING ---
+  useEffect(() => {
+    if (!sessionToken) return;
+
+    let interval: NodeJS.Timeout;
+
+    if (isPrimary) {
+      interval = setInterval(fetchPendingJoinRequests, 5000);
+    } else if (joinStatus === "pending") {
+      interval = setInterval(checkMySessionStatus, 3000);
+    }
+
+    return () => clearInterval(interval);
+  }, [sessionToken, isPrimary, joinStatus]);
+
+  // --- 4. API ACTIONS ---
+
+  const checkMySessionStatus = async () => {
+    try {
+      const res = await fetch(
+        `${BASE_URL}/menu/${restaurantId}/${tableId}/${qrToken}?session_token=${sessionToken}`,
+      );
+
+      if (res.ok) {
+        // APPROVED
+        const data = await res.json();
+        setMenu(data);
+        setJoinStatus("approved");
+
+        // Update Local Storage
         const key = `session_${restaurantId}_${tableId}`;
         const stored = await AsyncStorage.getItem(key);
         if (stored) {
           const parsed = JSON.parse(stored);
-          setSessionToken(parsed.session_token);
-          setCustomerName(parsed.customer_name);
-          setNameSubmitted(true);
-          fetchMenu(parsed.session_token);
-          fetchOrders(parsed.session_token);
+          parsed.join_status = "approved";
+          parsed.is_primary = data.session.is_primary;
+          await AsyncStorage.setItem(key, JSON.stringify(parsed));
         }
-      } catch (e) {
-        console.error("Session load error", e);
+
+        Alert.alert("Approved", "You can now order!");
+      } else {
+        // 🔴 REJECTION LOGIC
+        // If we get an error, we assume rejected UNLESS the backend explicitly says "pending"
+        let isStillPending = false;
+
+        if (res.status === 403) {
+          try {
+            const data = await res.json();
+            if (data.join_status === "pending") {
+              isStillPending = true; // Still waiting
+            }
+          } catch (e) {}
+        }
+
+        // If it is NOT pending, it implies REJECTION.
+        if (!isStillPending) {
+          setJoinStatus("rejected");
+        }
       }
-    };
-    loadSession();
-  }, []);
-
-  const fetchMenu = async (token: string) => {
-    setLoading(true);
-    try {
-      const res = await fetch(
-        `${BASE_URL}/menu/${restaurantId}/${tableId}/${qrToken}?session_token=${token}`,
-      );
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.message || "Unable to load menu");
-      setMenu(data);
-    } catch (err: any) {
-      Alert.alert("Menu Error", err.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const fetchOrders = async (token: string) => {
-    try {
-      const res = await fetch(`${BASE_URL}/orders/session/${token}`);
-      const data = await res.json();
-      if (res.ok) setOrders(data);
-    } catch (err) {
-      console.log("Order fetch error", err);
-    }
+    } catch (e) {}
   };
 
   const startSession = async () => {
-    if (!customerName.trim())
-      return Alert.alert("Required", "Please enter your name.");
-
+    if (!customerName.trim()) return Alert.alert("Required", "Enter name");
     setLoading(true);
+
     try {
+      const key = `session_${restaurantId}_${tableId}`;
+      await AsyncStorage.removeItem(key);
+
       const response = await fetch(
         `${BASE_URL}/qr/session/start/${restaurantId}/${tableId}/${qrToken}`,
         {
@@ -125,420 +253,434 @@ export default function Menu() {
           body: JSON.stringify({ customer_name: customerName }),
         },
       );
+
       const data = await response.json();
       if (!response.ok) throw new Error(data.message);
 
+      setSessionToken(data.session_token);
+      setCustomerName(data.customer_name || customerName);
+      setIsPrimary(data.is_primary);
+      setJoinStatus(data.join_status);
+      setNameSubmitted(true);
+
       await AsyncStorage.setItem(
-        `session_${restaurantId}_${tableId}`,
+        key,
         JSON.stringify({
           session_token: data.session_token,
-          customer_name: customerName,
+          customer_name: data.customer_name || customerName,
+          is_primary: data.is_primary,
+          join_status: data.join_status,
         }),
       );
 
-      setSessionToken(data.session_token);
-      setNameSubmitted(true);
-      fetchMenu(data.session_token);
-      fetchOrders(data.session_token);
+      if (
+        data.is_primary ||
+        data.join_status === "approved" ||
+        data.join_status === "active"
+      ) {
+        await fetchMenu(data.session_token);
+        fetchOrders(data.session_token);
+      }
     } catch (error: any) {
-      Alert.alert("Connection Error", error.message);
+      Alert.alert("Error", error.message);
     } finally {
       setLoading(false);
     }
   };
 
-  const placeOrder = async () => {
-    if (!sessionToken)
-      return Alert.alert("Session Expired", "Please scan QR again.");
-    if (orderData.totalQty === 0) return;
-
+  const fetchMenu = async (token: string) => {
     try {
-      const response = await fetch(`${BASE_URL}/orders`, {
+      const res = await fetch(
+        `${BASE_URL}/menu/${restaurantId}/${tableId}/${qrToken}?session_token=${token}`,
+      );
+      if (!res.ok) throw new Error("Menu Load Failed");
+      const data = await res.json();
+      setMenu(data);
+    } catch (err) {
+      console.log(err);
+    }
+  };
+
+  const fetchOrders = async (token: string) => {
+    try {
+      const res = await fetch(`${BASE_URL}/orders/session/${token}`);
+      if (res.ok) setOrders(await res.json());
+    } catch (err) {}
+  };
+
+  const fetchPendingJoinRequests = async () => {
+    try {
+      const res = await fetch(`${BASE_URL}/table/${tableId}/pending-requests`);
+      if (res.ok) {
+        const data = await res.json();
+        setPendingRequests(data);
+        if (data.length > 0 && !showRequestsModal) setShowRequestsModal(true);
+      }
+    } catch (e) {}
+  };
+
+  const respondToRequest = async (id: number, action: "approve" | "reject") => {
+    try {
+      await fetch(`${BASE_URL}/session/${id}/respond`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action }),
+      });
+      setPendingRequests((prev) => prev.filter((p) => p.id !== id));
+      if (pendingRequests.length <= 1) setShowRequestsModal(false);
+    } catch (e) {
+      Alert.alert("Error", "Network Error");
+    }
+  };
+
+  const placeOrder = async () => {
+    if (!sessionToken) return;
+    try {
+      const res = await fetch(`${BASE_URL}/orders`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           restaurant_id: restaurantId,
           table_id: tableId,
           session_token: sessionToken,
-          items: orderData.items.map((item) => ({
-            menu_item_id: item.id,
-            quantity: item.qty,
+          items: orderData.items.map((i) => ({
+            menu_item_id: i.id,
+            quantity: i.qty,
           })),
         }),
       });
-
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.message);
+      const data = await res.json();
+      if (res.status === 403) return Alert.alert("Wait", data.message);
+      if (!res.ok) throw new Error(data.message);
 
       setCart({});
       fetchOrders(sessionToken);
-      Alert.alert("Success", "Your order has been sent to the kitchen!");
-    } catch (err: any) {
-      Alert.alert("Order Failed", err.message);
+      Alert.alert("Success", "Order Placed");
+    } catch (e: any) {
+      Alert.alert("Error", e.message);
     }
   };
 
   const updateCart = (id: number, delta: number) => {
     setCart((prev) => {
-      const newQty = (prev[id] || 0) + delta;
-      if (newQty <= 0) {
-        const copy = { ...prev };
-        delete copy[id];
-        return copy;
+      const n = (prev[id] || 0) + delta;
+      if (n <= 0) {
+        const { [id]: _, ...r } = prev;
+        return r;
       }
-      return { ...prev, [id]: newQty };
+      return { ...prev, [id]: n };
     });
   };
 
   const orderData = useMemo(() => {
     if (!menu) return { items: [], totalQty: 0, totalPrice: 0 };
-    let totalQty = 0;
-    let totalPrice = 0;
-    const items: any[] = [];
-
-    menu.categories.forEach((cat: any) => {
-      cat.items.forEach((item: any) => {
-        const qty = cart[item.id];
-        if (qty > 0) {
-          totalQty += qty;
-          totalPrice += qty * parseFloat(item.price);
-          items.push({ ...item, qty });
+    let q = 0,
+      p = 0,
+      items: any[] = [];
+    menu.categories.forEach((c: any) =>
+      c.items.forEach((i: any) => {
+        if (cart[i.id]) {
+          q += cart[i.id];
+          p += cart[i.id] * parseFloat(i.price);
+          items.push({ ...i, qty: cart[i.id] });
         }
-      });
-    });
-    return { items, totalQty, totalPrice };
+      }),
+    );
+    return { items, totalQty: q, totalPrice: p };
   }, [cart, menu]);
 
-  const grandTotal = useMemo(() => {
-    return orders.reduce(
-      (sum, order) => sum + parseFloat(order.total_amount),
-      0,
-    );
-  }, [orders]);
+  const grandTotal = useMemo(
+    () => orders.reduce((s, o) => s + parseFloat(o.total_amount), 0),
+    [orders],
+  );
 
-  if (loading && !menu && nameSubmitted) {
+  // ==================== VIEW RENDER LOGIC ====================
+
+  // 1. GLOBAL LOADING (Initial check)
+  if (loading)
     return (
       <View style={styles.centerContainer}>
         <ActivityIndicator size="large" color={THEME.primary} />
+        <Text style={{ marginTop: 15, color: THEME.textSecondary }}>
+          Connecting...
+        </Text>
       </View>
     );
-  }
 
-  if (!nameSubmitted) {
+  // 2. LOGIN SCREEN (No user name)
+  if (!nameSubmitted)
     return (
       <SafeAreaView style={styles.safeArea}>
         <View style={styles.authContainer}>
           <Text style={styles.authEmoji}>🍽️</Text>
-          <Text style={styles.authTitle}>Let's get started</Text>
-          <Text style={styles.authSubtitle}>
-            Enter your name to start ordering.
-          </Text>
+          <Text style={styles.authTitle}>Join Table</Text>
           <View style={styles.inputGroup}>
             <Text style={styles.label}>Your Name</Text>
             <TextInput
-              placeholder="e.g. John Doe"
+              style={styles.textInput}
+              placeholder="Enter your name"
               value={customerName}
               onChangeText={setCustomerName}
-              style={styles.textInput}
             />
           </View>
           <TouchableOpacity style={styles.primaryBtn} onPress={startSession}>
-            {loading ? (
-              <ActivityIndicator color="white" />
-            ) : (
-              <Text style={styles.primaryBtnText}>View Menu</Text>
-            )}
+            <Text style={styles.primaryBtnText}>Join</Text>
           </TouchableOpacity>
         </View>
       </SafeAreaView>
     );
-  }
 
+  // 3. REJECTED SCREEN (🔥 PRIORITY OVER MENU 🔥)
+  // This must be checked BEFORE the menu check to avoid showing the loading spinner.
+  if (joinStatus === "rejected")
+    return (
+      <View style={styles.centerContainer}>
+        <Ionicons name="close-circle" size={80} color={THEME.danger} />
+        <Text style={[styles.authTitle, { marginTop: 20 }]}>
+          Request Rejected
+        </Text>
+        <Text
+          style={{
+            color: THEME.textSecondary,
+            textAlign: "center",
+            paddingHorizontal: 30,
+            marginBottom: 30,
+          }}
+        >
+          The Host has declined your request to join this table.
+        </Text>
+        <TouchableOpacity onPress={clearSession} style={styles.primaryBtn}>
+          <Text style={styles.primaryBtnText}>Try Again</Text>
+        </TouchableOpacity>
+      </View>
+    );
+
+  // 4. PENDING (WAITING ROOM)
+  if (joinStatus === "pending")
+    return (
+      <View style={styles.centerContainer}>
+        <ActivityIndicator size="large" color={THEME.warning} />
+        <Text style={[styles.authTitle, { marginTop: 20 }]}>Waiting...</Text>
+        <Text
+          style={{
+            color: THEME.textSecondary,
+            textAlign: "center",
+            paddingHorizontal: 30,
+          }}
+        >
+          Waiting for host to approve{" "}
+          <Text style={{ fontWeight: "bold" }}>{customerName}</Text>
+        </Text>
+        <TouchableOpacity onPress={clearSession} style={{ marginTop: 30 }}>
+          <Text
+            style={{
+              color: THEME.textSecondary,
+              textDecorationLine: "underline",
+            }}
+          >
+            Cancel Request
+          </Text>
+        </TouchableOpacity>
+      </View>
+    );
+
+  // 5. LOADING MENU (Fallback)
+  // Only show this if we are NOT rejected, NOT pending, but menu is still null
+  if (!menu)
+    return (
+      <View style={styles.centerContainer}>
+        <ActivityIndicator color={THEME.primary} />
+        <Text style={{ marginTop: 10, color: "gray" }}>Loading Menu...</Text>
+        <TouchableOpacity
+          onPress={() => fetchMenu(sessionToken!)}
+          style={{ marginTop: 20 }}
+        >
+          <Text style={{ color: THEME.primary }}>Retry</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          onPress={clearSession}
+          style={{
+            marginTop: 40,
+            backgroundColor: "#f0f0f0",
+            padding: 10,
+            borderRadius: 8,
+          }}
+        >
+          <Text style={{ color: "black" }}>Reset</Text>
+        </TouchableOpacity>
+      </View>
+    );
+
+  // 6. MAIN APP RENDER
   return (
     <View style={styles.container}>
       <StatusBar style="dark" />
       <SafeAreaView style={styles.safeArea}>
-        {/* Header */}
+        {/* HEADER */}
         <View style={styles.header}>
           <View>
-            <Text style={styles.headerGreeting}>Hi, {customerName}</Text>
-            <Text style={styles.headerSubtitle}>Table #{tableId}</Text>
+            <Text style={styles.headerGreeting}>
+              {customerName} {isPrimary && "(Host)"}
+            </Text>
+            <Text style={styles.headerSubtitle}>Table {tableId}</Text>
           </View>
-          {orders.length > 0 && (
+          <View style={{ flexDirection: "row", gap: 10 }}>
+            {isPrimary && pendingRequests.length > 0 && (
+              <TouchableOpacity
+                style={[
+                  styles.billBtnHeader,
+                  { backgroundColor: THEME.warning },
+                ]}
+                onPress={() => setShowRequestsModal(true)}
+              >
+                <Text style={{ color: "white", fontWeight: "bold" }}>
+                  {pendingRequests.length} Req
+                </Text>
+              </TouchableOpacity>
+            )}
             <TouchableOpacity
-              style={styles.billBtnHeader}
-              onPress={() => setShowTotalBill(true)}
+              style={[styles.billBtnHeader, { backgroundColor: "#636E72" }]}
+              onPress={clearSession}
             >
-              <Ionicons name="receipt-outline" size={16} color="white" />
-              <Text style={styles.billBtnText}>
-                Bill: ₹{grandTotal.toFixed(0)}
-              </Text>
+              <Ionicons name="log-out-outline" size={18} color="white" />
             </TouchableOpacity>
-          )}
+            {orders.length > 0 && (
+              <TouchableOpacity
+                style={styles.billBtnHeader}
+                onPress={() => setShowTotalBill(true)}
+              >
+                <Text style={{ color: "white" }}>₹{grandTotal.toFixed(0)}</Text>
+              </TouchableOpacity>
+            )}
+          </View>
         </View>
 
-        <ScrollView
-          contentContainerStyle={styles.scrollContent}
-          showsVerticalScrollIndicator={false}
-        >
-          {/* Order History Section */}
-          {orders.length > 0 && (
-            <View style={styles.section}>
-              <View style={styles.sectionHeader}>
-                <Text style={styles.sectionTitle}>Recent Orders</Text>
-              </View>
-              <ScrollView
-                horizontal
-                showsHorizontalScrollIndicator={false}
-                style={{ marginHorizontal: -20, paddingHorizontal: 20 }}
-              >
-                {orders.map((order) => (
-                  <TouchableOpacity
-                    key={order.id}
-                    style={styles.orderCard}
-                    onPress={() => setSelectedOrder(order)}
-                  >
-                    <View style={styles.orderHeader}>
-                      <Text style={styles.orderId}>#{order.id}</Text>
-                      <View
-                        style={[
-                          styles.statusBadge,
-                          {
-                            backgroundColor:
-                              order.status === "completed"
-                                ? "#E3FCEF"
-                                : "#FFF4E5",
-                          },
-                        ]}
-                      >
-                        <Text
-                          style={[
-                            styles.statusText,
-                            {
-                              color:
-                                order.status === "completed"
-                                  ? "#006644"
-                                  : "#B95000",
-                            },
-                          ]}
+        {/* MENU LIST */}
+        <ScrollView contentContainerStyle={styles.scrollContent}>
+          {menu.categories.map((cat: any) => (
+            <View key={cat.id} style={styles.section}>
+              <Text style={styles.categoryTitle}>{cat.name}</Text>
+              {cat.items.map((item: any) => (
+                <View key={item.id} style={styles.menuItemCard}>
+                  <View style={styles.itemInfo}>
+                    <Text style={styles.itemName}>{item.name}</Text>
+                    <Text style={styles.itemDescription}>
+                      {item.description}
+                    </Text>
+                    <Text style={styles.itemPrice}>₹{item.price}</Text>
+                  </View>
+                  <View style={styles.qtyContainer}>
+                    {cart[item.id] ? (
+                      <View style={styles.qtySelector}>
+                        <TouchableOpacity
+                          onPress={() => updateCart(item.id, -1)}
+                          style={styles.qtyBtn}
                         >
-                          {order.status.toUpperCase()}
-                        </Text>
+                          <Ionicons name="remove" size={16} />
+                        </TouchableOpacity>
+                        <Text style={styles.qtyText}>{cart[item.id]}</Text>
+                        <TouchableOpacity
+                          onPress={() => updateCart(item.id, 1)}
+                          style={styles.qtyBtn}
+                        >
+                          <Ionicons name="add" size={16} />
+                        </TouchableOpacity>
                       </View>
-                    </View>
-                    <Text style={styles.orderTotal}>
-                      ₹{formatPrice(order.total_amount)}
-                    </Text>
-                    <Text style={styles.orderItems}>
-                      {order.items.length} items • Tap for details
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-              </ScrollView>
+                    ) : (
+                      <TouchableOpacity
+                        onPress={() => updateCart(item.id, 1)}
+                        style={styles.addBtn}
+                      >
+                        <Text style={styles.addBtnText}>ADD</Text>
+                      </TouchableOpacity>
+                    )}
+                  </View>
+                </View>
+              ))}
             </View>
-          )}
-
-          {/* Menu Categories */}
-          {!menu ? (
-            <Text style={styles.errorText}>Menu unavailable</Text>
-          ) : (
-            menu.categories.map((category: any) => (
-              <View key={category.id} style={styles.section}>
-                <Text style={styles.categoryTitle}>{category.name}</Text>
-                {category.items.map((item: any) => {
-                  const quantity = cart[item.id] || 0;
-                  return (
-                    <View key={item.id} style={styles.menuItemCard}>
-                      <View style={styles.itemInfo}>
-                        <Text style={styles.itemName}>{item.name}</Text>
-                        <Text style={styles.itemDescription} numberOfLines={2}>
-                          {item.description}
-                        </Text>
-                        <Text style={styles.itemPrice}>
-                          ₹{formatPrice(item.price)}
-                        </Text>
-                      </View>
-                      <View style={styles.qtyContainer}>
-                        {quantity > 0 ? (
-                          <View style={styles.qtySelector}>
-                            <TouchableOpacity
-                              onPress={() => updateCart(item.id, -1)}
-                              style={styles.qtyBtn}
-                            >
-                              <Ionicons
-                                name="remove"
-                                size={18}
-                                color={THEME.primary}
-                              />
-                            </TouchableOpacity>
-                            <Text style={styles.qtyText}>{quantity}</Text>
-                            <TouchableOpacity
-                              onPress={() => updateCart(item.id, 1)}
-                              style={styles.qtyBtn}
-                            >
-                              <Ionicons
-                                name="add"
-                                size={18}
-                                color={THEME.primary}
-                              />
-                            </TouchableOpacity>
-                          </View>
-                        ) : (
-                          <TouchableOpacity
-                            onPress={() => updateCart(item.id, 1)}
-                            style={styles.addBtn}
-                          >
-                            <Text style={styles.addBtnText}>ADD</Text>
-                          </TouchableOpacity>
-                        )}
-                      </View>
-                    </View>
-                  );
-                })}
-              </View>
-            ))
-          )}
+          ))}
         </ScrollView>
 
-        {/* Floating Cart Button */}
+        {/* CHECKOUT */}
         {orderData.totalQty > 0 && (
           <View style={styles.footerContainer}>
             <TouchableOpacity style={styles.checkoutBtn} onPress={placeOrder}>
-              <View style={styles.checkoutInfo}>
-                <View style={styles.badge}>
-                  <Text style={styles.badgeText}>{orderData.totalQty}</Text>
-                </View>
-                <Text style={styles.checkoutText}>Place Order</Text>
-              </View>
-              <Text style={styles.checkoutPrice}>
-                ₹{orderData.totalPrice.toFixed(2)}
+              <Text style={styles.checkoutText}>
+                {orderData.totalQty} Items | ₹{orderData.totalPrice}
               </Text>
+              <Text style={styles.checkoutText}>Place Order</Text>
             </TouchableOpacity>
           </View>
         )}
 
-        {/* --- MODAL 1: SINGLE ORDER DETAILS --- */}
-        <Modal visible={!!selectedOrder} animationType="slide" transparent>
+        {/* MODALS */}
+        <Modal visible={showRequestsModal} transparent animationType="slide">
           <View style={styles.modalOverlay}>
             <View style={styles.modalContent}>
               <View style={styles.modalHeader}>
-                <Text style={styles.modalTitle}>
-                  Order Details #{selectedOrder?.id}
-                </Text>
-                <TouchableOpacity
-                  onPress={() => setSelectedOrder(null)}
-                  hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-                >
-                  <Ionicons
-                    name="close-circle"
-                    size={28}
-                    color={THEME.textSecondary}
-                  />
+                <Text style={styles.modalTitle}>Requests</Text>
+                <TouchableOpacity onPress={() => setShowRequestsModal(false)}>
+                  <Ionicons name="close" size={24} />
                 </TouchableOpacity>
               </View>
-
-              <ScrollView showsVerticalScrollIndicator={false}>
-                {selectedOrder?.items.map((item: any, index: number) => (
-                  <View key={index} style={styles.receiptRow}>
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.receiptItemName}>
-                        {item.item_name || "Item"}
-                      </Text>
-                      <Text style={styles.receiptItemQty}>
-                        Qty: {item.quantity}
-                      </Text>
-                    </View>
-                    {/* UPDATED: Pass the whole item object */}
-                    <Text style={styles.receiptItemPrice}>
-                      ₹{calculateItemTotal(item)}
-                    </Text>
+              {pendingRequests.map((r) => (
+                <View key={r.id} style={styles.requestRow}>
+                  <Text style={styles.requestName}>{r.customer_name}</Text>
+                  <View style={{ flexDirection: "row", gap: 10 }}>
+                    <TouchableOpacity
+                      onPress={() => respondToRequest(r.id, "reject")}
+                      style={[styles.actionBtn, { backgroundColor: "#ffe5e5" }]}
+                    >
+                      <Ionicons name="close" color="red" size={20} />
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      onPress={() => respondToRequest(r.id, "approve")}
+                      style={[styles.actionBtn, { backgroundColor: "#e5fff5" }]}
+                    >
+                      <Ionicons name="checkmark" color="green" size={20} />
+                    </TouchableOpacity>
                   </View>
-                ))}
-                <View style={styles.divider} />
-                <View style={styles.receiptRow}>
-                  <Text style={styles.receiptTotalLabel}>Total</Text>
-                  <Text style={styles.receiptTotalValue}>
-                    ₹{formatPrice(selectedOrder?.total_amount)}
-                  </Text>
                 </View>
-                <View style={styles.receiptRow}>
-                  <Text style={styles.receiptStatusLabel}>Status</Text>
-                  <Text style={styles.receiptStatusValue}>
-                    {selectedOrder?.status.toUpperCase()}
-                  </Text>
-                </View>
-                <View style={{ height: 20 }} />
-              </ScrollView>
+              ))}
             </View>
           </View>
         </Modal>
 
-        {/* --- MODAL 2: TOTAL BILL --- */}
-        <Modal visible={showTotalBill} animationType="slide" transparent>
+        <Modal visible={showTotalBill} transparent animationType="slide">
           <View style={styles.modalOverlay}>
             <View style={styles.modalContent}>
               <View style={styles.modalHeader}>
-                <Text style={styles.modalTitle}>Total Bill</Text>
-                <TouchableOpacity
-                  onPress={() => setShowTotalBill(false)}
-                  hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-                >
-                  <Ionicons
-                    name="close-circle"
-                    size={28}
-                    color={THEME.textSecondary}
-                  />
+                <Text style={styles.modalTitle}>Bill</Text>
+                <TouchableOpacity onPress={() => setShowTotalBill(false)}>
+                  <Ionicons name="close" size={24} />
                 </TouchableOpacity>
               </View>
-
-              <ScrollView showsVerticalScrollIndicator={false}>
-                <Text style={styles.billSectionTitle}>Order Summary</Text>
-                {orders.map((order, idx) => (
-                  <View key={order.id} style={{ marginBottom: 15 }}>
-                    <Text style={styles.billOrderHeader}>
-                      Order #{order.id} (
-                      {new Date(order.created_at).toLocaleTimeString([], {
-                        hour: "2-digit",
-                        minute: "2-digit",
-                      })}
-                      )
-                    </Text>
-                    {order.items.map((item: any, i: number) => (
-                      <View key={i} style={styles.billRow}>
-                        <Text style={styles.billItemText}>
-                          {item.quantity} x {item.item_name}
-                        </Text>
-                        {/* UPDATED: Pass the whole item object */}
-                        <Text style={styles.billItemPrice}>
-                          ₹{calculateItemTotal(item)}
-                        </Text>
-                      </View>
+              <ScrollView>
+                {orders.map((o) => (
+                  <View
+                    key={o.id}
+                    style={{
+                      marginBottom: 10,
+                      paddingBottom: 10,
+                      borderBottomWidth: 1,
+                      borderColor: "#eee",
+                    }}
+                  >
+                    <Text style={{ fontWeight: "bold" }}>Order #{o.id}</Text>
+                    {o.items.map((i: any, idx: number) => (
+                      <Text key={idx}>
+                        {i.quantity} x {i.item_name} - ₹
+                        {i.quantity * i.unit_price}
+                      </Text>
                     ))}
                   </View>
                 ))}
-
-                <View style={styles.divider} />
-
-                <View style={styles.billRow}>
-                  <Text style={styles.billTotalLabel}>Grand Total</Text>
-                  <Text style={styles.billTotalValue}>
-                    ₹{grandTotal.toFixed(2)}
-                  </Text>
-                </View>
-
-                <Text style={styles.billNote}>
-                  Please proceed to the counter to pay or ask your waiter.
+                <Text
+                  style={{ fontSize: 20, fontWeight: "bold", marginTop: 10 }}
+                >
+                  Total: ₹{grandTotal}
                 </Text>
-
-                <View style={{ height: 20 }} />
               </ScrollView>
-
-              <TouchableOpacity
-                style={styles.requestBillBtn}
-                onPress={() => setShowTotalBill(false)}
-              >
-                <Text style={styles.requestBillText}>Close</Text>
-              </TouchableOpacity>
             </View>
           </View>
         </Modal>
@@ -550,169 +692,77 @@ export default function Menu() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: THEME.background },
   safeArea: { flex: 1 },
-  centerContainer: { flex: 1, justifyContent: "center", alignItems: "center" },
-
-  // Header
+  centerContainer: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 20,
+  },
   header: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
-    paddingHorizontal: 20,
-    paddingVertical: 16,
+    padding: 15,
     backgroundColor: "white",
     borderBottomWidth: 1,
-    borderBottomColor: "#F0F0F0",
+    borderColor: "#eee",
   },
-  headerGreeting: { fontSize: 20, fontWeight: "700", color: THEME.textPrimary },
-  headerSubtitle: { fontSize: 14, color: THEME.textSecondary },
+  headerGreeting: { fontSize: 18, fontWeight: "bold" },
+  headerSubtitle: { color: "gray" },
   billBtnHeader: {
+    padding: 8,
+    borderRadius: 8,
+    marginLeft: 5,
     backgroundColor: THEME.primary,
-    flexDirection: "row",
-    alignItems: "center",
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 20,
-    gap: 5,
   },
-  billBtnText: { color: "white", fontWeight: "bold", fontSize: 14 },
-
-  // Sections
-  scrollContent: { paddingBottom: 100 },
-  section: { marginTop: 24, paddingHorizontal: 20 },
-  sectionHeader: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    marginBottom: 12,
-  },
-  sectionTitle: { fontSize: 18, fontWeight: "700", color: THEME.textPrimary },
-  categoryTitle: {
-    fontSize: 22,
-    fontWeight: "800",
-    color: THEME.textPrimary,
-    marginBottom: 16,
-  },
-
-  // Order Card
-  orderCard: {
-    backgroundColor: "white",
-    padding: 16,
-    borderRadius: 12,
-    marginRight: 12,
-    width: 170,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.05,
-    shadowRadius: 4,
-    elevation: 2,
-    borderWidth: 1,
-    borderColor: "#F0F0F0",
-  },
-  orderHeader: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    marginBottom: 8,
-  },
-  orderId: { fontWeight: "700", color: THEME.textPrimary },
-  statusBadge: { paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 },
-  statusText: { fontSize: 10, fontWeight: "700" },
-  orderTotal: {
-    fontSize: 16,
-    fontWeight: "bold",
-    color: THEME.textPrimary,
-    marginBottom: 4,
-  },
-  orderItems: { fontSize: 12, color: THEME.textSecondary },
-
-  // Menu Item
+  scrollContent: { padding: 15, paddingBottom: 100 },
+  section: { marginBottom: 20 },
+  categoryTitle: { fontSize: 20, fontWeight: "bold", marginBottom: 10 },
   menuItemCard: {
     flexDirection: "row",
     backgroundColor: "white",
-    padding: 16,
-    borderRadius: 16,
-    marginBottom: 16,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.05,
-    shadowRadius: 8,
+    padding: 10,
+    borderRadius: 10,
+    marginBottom: 10,
     elevation: 2,
   },
-  itemInfo: { flex: 1, paddingRight: 16 },
-  itemName: {
-    fontSize: 16,
-    fontWeight: "700",
-    color: THEME.textPrimary,
-    marginBottom: 4,
-  },
-  itemDescription: {
-    fontSize: 13,
-    color: THEME.textSecondary,
-    marginBottom: 8,
-  },
-  itemPrice: { fontSize: 15, fontWeight: "700", color: THEME.textPrimary },
-  qtyContainer: { justifyContent: "center", alignItems: "center" },
-  addBtn: {
-    backgroundColor: "#FFF0F0",
-    paddingVertical: 8,
-    paddingHorizontal: 20,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: "#FFDCDC",
-  },
-  addBtnText: { color: THEME.primary, fontWeight: "700", fontSize: 12 },
+  itemInfo: { flex: 1 },
+  itemName: { fontSize: 16, fontWeight: "bold" },
+  itemDescription: { color: "gray", fontSize: 12 },
+  itemPrice: { fontWeight: "bold", marginTop: 5 },
+  qtyContainer: { justifyContent: "center", marginLeft: 10 },
   qtySelector: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "white",
     borderWidth: 1,
-    borderColor: "#E0E0E0",
-    borderRadius: 8,
-    padding: 4,
+    borderColor: "#ddd",
+    borderRadius: 5,
   },
-  qtyBtn: { padding: 6 },
-  qtyText: { marginHorizontal: 8, fontWeight: "600", fontSize: 14 },
-
-  // Footer / Cart
+  qtyBtn: { padding: 5 },
+  qtyText: { marginHorizontal: 10, fontWeight: "bold" },
+  addBtn: { backgroundColor: "#fff0f0", padding: 8, borderRadius: 5 },
+  addBtnText: { color: THEME.primary, fontWeight: "bold" },
   footerContainer: {
     position: "absolute",
     bottom: 0,
     left: 0,
     right: 0,
+    padding: 20,
     backgroundColor: "white",
-    paddingVertical: 16,
-    paddingHorizontal: 20,
     borderTopWidth: 1,
-    borderTopColor: "#F0F0F0",
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: -4 },
-    shadowOpacity: 0.05,
-    shadowRadius: 4,
-    elevation: 10,
+    borderColor: "#eee",
   },
   checkoutBtn: {
     backgroundColor: THEME.primary,
+    padding: 15,
+    borderRadius: 10,
     flexDirection: "row",
     justifyContent: "space-between",
-    alignItems: "center",
-    padding: 16,
-    borderRadius: 12,
   },
-  checkoutInfo: { flexDirection: "row", alignItems: "center" },
-  badge: {
-    backgroundColor: "rgba(0,0,0,0.2)",
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 4,
-    marginRight: 12,
-  },
-  badgeText: { color: "white", fontWeight: "bold" },
-  checkoutText: { color: "white", fontSize: 16, fontWeight: "700" },
-  checkoutPrice: { color: "white", fontSize: 18, fontWeight: "800" },
-
-  // Modals (Receipts) - FIXED
+  checkoutText: { color: "white", fontWeight: "bold" },
   modalOverlay: {
     flex: 1,
-    backgroundColor: THEME.overlay,
+    backgroundColor: "rgba(0,0,0,0.5)",
     justifyContent: "flex-end",
   },
   modalContent: {
@@ -720,118 +770,46 @@ const styles = StyleSheet.create({
     borderTopLeftRadius: 20,
     borderTopRightRadius: 20,
     padding: 20,
-    width: "100%",
-    maxHeight: "85%", // Fix for screen overflow
-    paddingBottom: 40,
+    maxHeight: "80%",
   },
   modalHeader: {
     flexDirection: "row",
     justifyContent: "space-between",
-    alignItems: "center",
     marginBottom: 20,
-    borderBottomWidth: 1,
-    borderBottomColor: "#eee",
-    paddingBottom: 15,
   },
   modalTitle: { fontSize: 20, fontWeight: "bold" },
-  receiptRow: {
+  requestRow: {
     flexDirection: "row",
     justifyContent: "space-between",
-    marginBottom: 12,
-  },
-  receiptItemName: {
-    fontSize: 16,
-    fontWeight: "600",
-    color: THEME.textPrimary,
-  },
-  receiptItemQty: { fontSize: 14, color: THEME.textSecondary, marginTop: 2 },
-  receiptItemPrice: { fontSize: 16, fontWeight: "600" },
-  divider: { height: 1, backgroundColor: "#eee", marginVertical: 15 },
-  receiptTotalLabel: { fontSize: 18, fontWeight: "bold" },
-  receiptTotalValue: { fontSize: 18, fontWeight: "bold", color: THEME.primary },
-  receiptStatusLabel: { fontSize: 14, color: THEME.textSecondary },
-  receiptStatusValue: {
-    fontSize: 14,
-    fontWeight: "bold",
-    color: THEME.textPrimary,
-  },
-
-  // Bill Modal Specific
-  billSectionTitle: {
-    fontSize: 14,
-    color: THEME.textSecondary,
-    marginBottom: 10,
-    textTransform: "uppercase",
-    letterSpacing: 1,
-  },
-  billOrderHeader: {
-    fontSize: 14,
-    fontWeight: "bold",
-    color: "#888",
-    marginBottom: 5,
-  },
-  billRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    marginBottom: 6,
-  },
-  billItemText: { fontSize: 15, color: THEME.textPrimary },
-  billItemPrice: { fontSize: 15, fontWeight: "500" },
-  billTotalLabel: { fontSize: 22, fontWeight: "800" },
-  billTotalValue: { fontSize: 22, fontWeight: "800", color: THEME.textPrimary },
-  billNote: {
-    textAlign: "center",
-    color: "#999",
-    fontSize: 12,
-    marginTop: 20,
-    fontStyle: "italic",
-  },
-  requestBillBtn: {
-    backgroundColor: "black",
-    padding: 16,
-    borderRadius: 12,
-    marginTop: 20,
     alignItems: "center",
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderColor: "#eee",
   },
-  requestBillText: { color: "white", fontWeight: "bold", fontSize: 16 },
-
-  // Auth
-  authContainer: {
-    flex: 1,
-    justifyContent: "center",
-    padding: 24,
-    backgroundColor: "white",
-  },
-  authEmoji: { fontSize: 48, marginBottom: 16 },
+  requestName: { fontSize: 16, fontWeight: "bold" },
+  actionBtn: { padding: 8, borderRadius: 5 },
+  authContainer: { flex: 1, justifyContent: "center", padding: 20 },
+  authEmoji: { fontSize: 50, textAlign: "center", marginBottom: 20 },
   authTitle: {
-    fontSize: 32,
-    fontWeight: "800",
-    color: THEME.textPrimary,
-    marginBottom: 8,
+    fontSize: 24,
+    fontWeight: "bold",
+    textAlign: "center",
+    marginBottom: 20,
   },
-  authSubtitle: { fontSize: 16, color: THEME.textSecondary, marginBottom: 30 },
-  inputGroup: { marginBottom: 30 },
-  label: {
-    fontSize: 14,
-    fontWeight: "600",
-    color: THEME.textPrimary,
-    marginBottom: 8,
-    textTransform: "uppercase",
-  },
+  inputGroup: { marginBottom: 20 },
+  label: { fontWeight: "bold", marginBottom: 5 },
   textInput: {
     borderWidth: 1,
-    borderColor: "#E0E0E0",
-    borderRadius: 12,
-    padding: 16,
-    fontSize: 18,
-    backgroundColor: "#FAFAFA",
+    borderColor: "#ddd",
+    padding: 10,
+    borderRadius: 10,
+    fontSize: 16,
   },
   primaryBtn: {
     backgroundColor: THEME.primary,
-    paddingVertical: 18,
-    borderRadius: 12,
+    padding: 15,
+    borderRadius: 10,
     alignItems: "center",
   },
-  primaryBtnText: { color: "white", fontSize: 18, fontWeight: "700" },
-  errorText: { textAlign: "center", marginTop: 50, color: "red" },
+  primaryBtnText: { color: "white", fontWeight: "bold", fontSize: 16 },
 });
