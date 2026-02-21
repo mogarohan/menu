@@ -1,11 +1,13 @@
-import { StyleSheet, Text, View } from "react-native";
-
+import { router } from "expo-router";
+import { StyleSheet, Text, TouchableOpacity } from "react-native";
 export default function HomeScreen() {
   return (
-    <View style={styles.container}>
-      <Text style={styles.title}>🍽 Restaurant App</Text>
-      <Text style={styles.subtitle}>Welcome! Browse menu & order food</Text>
-    </View>
+    <TouchableOpacity
+      onPress={() => router.push("/waiter")} // Use "/waiter/WaiterApp" if you didn't rename it
+      style={{ padding: 20, backgroundColor: "#F97316", borderRadius: 10 }}
+    >
+      <Text style={{ color: "white", fontWeight: "bold" }}>Staff Login</Text>
+    </TouchableOpacity>
   );
 }
 
