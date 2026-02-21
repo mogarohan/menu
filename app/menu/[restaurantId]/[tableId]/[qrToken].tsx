@@ -6,6 +6,8 @@ import { useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
+  Dimensions,
+  Image,
   Modal,
   SafeAreaView,
   ScrollView,
@@ -16,11 +18,13 @@ import {
   View,
 } from "react-native";
 
+const { width } = Dimensions.get("window");
+
 // ⚠️ CHANGE THIS TO YOUR IP
 const BASE_URL = "http://192.168.1.32:8000/api";
 
 const THEME = {
-  primary: "#FF6B6B",
+  primary: "#1b98eb", // Updated to your preferred Blue Theme
   secondary: "#2D3436",
   background: "#F8F9FA",
   cardBg: "#FFFFFF",
@@ -52,13 +56,19 @@ export default function Menu() {
 
   const [menu, setMenu] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+  const [placingOrder, setPlacingOrder] = useState(false);
   const [cart, setCart] = useState<Record<number, number>>({});
   const [orders, setOrders] = useState<any[]>([]);
 
+  // UI Navigation State
+  const [activeTab, setActiveTab] = useState<"MENU" | "ORDERS" | "PAYMENT">(
+    "MENU",
+  );
+  const [showSuccessModal, setShowSuccessModal] = useState(false);
+
   // Host UI State
-  const [showTotalBill, setShowTotalBill] = useState(false);
   const [pendingRequests, setPendingRequests] = useState<any[]>([]);
-  const [activeGuests, setActiveGuests] = useState<any[]>([]); // To show who joined
+  const [activeGuests, setActiveGuests] = useState<any[]>([]);
   const [showRequestsModal, setShowRequestsModal] = useState(false);
 
   // --- 1. RESET HELPER ---
@@ -82,8 +92,8 @@ export default function Menu() {
       setOrders([]);
       setIsPrimary(false);
       setJoinStatus(null);
+      setActiveTab("MENU");
 
-      // 🔥 FIX 1: Fetch fresh table status immediately after leaving so "Join/Split" works
       await checkTableStatus();
     } catch (e) {
       console.error(e);
@@ -101,7 +111,7 @@ export default function Menu() {
       if (data.has_active_host) {
         setExistingHostName(data.host_name);
         setShowJoinChoice(true);
-        setSelectedMode("join"); // Suggest join by default
+        setSelectedMode("join");
       } else {
         setShowJoinChoice(false);
         setSelectedMode("new");
@@ -121,7 +131,6 @@ export default function Menu() {
         const stored = await AsyncStorage.getItem(key);
 
         if (!stored) {
-          // No session? Check if table has a host so we can show Join/Split UI
           await checkTableStatus();
           setLoading(false);
           return;
@@ -142,7 +151,6 @@ export default function Menu() {
                 setLoading(false);
                 return;
               }
-              // If it's pending, let it proceed to restore state
             } catch (e) {
               await clearSession();
               return;
@@ -153,7 +161,6 @@ export default function Menu() {
           }
         }
 
-        // Restore Success
         const data = await res.json();
         setSessionToken(parsed.session_token);
         setCustomerName(parsed.customer_name);
@@ -188,27 +195,21 @@ export default function Menu() {
   // --- 3. POLLING ---
   useEffect(() => {
     if (!sessionToken) return;
-
     let interval: NodeJS.Timeout;
-
     if (isPrimary) {
       interval = setInterval(fetchHostTableData, 5000);
     } else if (joinStatus === "pending") {
       interval = setInterval(checkMySessionStatus, 3000);
     }
-
     return () => clearInterval(interval);
   }, [sessionToken, isPrimary, joinStatus]);
 
   // --- 4. API ACTIONS ---
-
-  // 🔥 FIX 2: Correctly read 403 Pending vs Rejected 🔥
   const checkMySessionStatus = async () => {
     try {
       const res = await fetch(
         `${BASE_URL}/menu/${restaurantId}/${tableId}/${qrToken}?session_token=${sessionToken}`,
       );
-
       if (res.ok) {
         const data = await res.json();
         setMenu(data);
@@ -222,14 +223,9 @@ export default function Menu() {
           await AsyncStorage.setItem(key, JSON.stringify(parsed));
         }
       } else if (res.status === 403) {
-        // Read JSON to check if still pending
         const data = await res.json();
-        if (data.join_status === "rejected") {
-          setJoinStatus("rejected");
-        }
-        // If data.join_status is "pending", it simply does nothing and keeps waiting.
+        if (data.join_status === "rejected") setJoinStatus("rejected");
       } else if (res.status === 401 || res.status === 404) {
-        // Session destroyed entirely
         setJoinStatus("rejected");
       }
     } catch (e) {}
@@ -253,7 +249,7 @@ export default function Menu() {
           },
           body: JSON.stringify({
             customer_name: customerName,
-            mode: selectedMode, // 'new' or 'join'
+            mode: selectedMode,
           }),
         },
       );
@@ -309,7 +305,6 @@ export default function Menu() {
     } catch (err) {}
   };
 
-  // 🔥 FIX 3: Host fetches pending AND active guests
   const fetchHostTableData = async () => {
     try {
       const res = await fetch(`${BASE_URL}/table/${tableId}/pending-requests`);
@@ -317,11 +312,8 @@ export default function Menu() {
         const data = await res.json();
         setPendingRequests(data.pending || []);
         setActiveGuests(data.guests || []);
-
-        // Auto-open modal if there is a NEW pending request
-        if (data.pending?.length > 0 && !showRequestsModal) {
+        if (data.pending?.length > 0 && !showRequestsModal)
           setShowRequestsModal(true);
-        }
       }
     } catch (e) {}
   };
@@ -333,16 +325,16 @@ export default function Menu() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action }),
       });
-      // Refresh list immediately
       fetchHostTableData();
       if (pendingRequests.length <= 1) setShowRequestsModal(false);
     } catch (e) {}
   };
 
   const placeOrder = async () => {
-    if (!sessionToken) return;
+    if (placingOrder || !sessionToken || orderData.totalQty === 0) return;
+    setPlacingOrder(true);
     try {
-      const res = await fetch(`${BASE_URL}/orders`, {
+      const response = await fetch(`${BASE_URL}/orders`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -355,17 +347,36 @@ export default function Menu() {
           })),
         }),
       });
-      const data = await res.json();
-      if (res.status === 403) return Alert.alert("Wait", data.message);
-      if (!res.ok) throw new Error(data.message);
+      const data = await response.json();
+      if (response.status === 401 || response.status === 403) {
+        await clearSession();
+        return Alert.alert("Session Expired", "Please start again.");
+      }
+      if (!response.ok) throw new Error(data.message);
 
       setCart({});
       fetchOrders(sessionToken);
-      Alert.alert("Success", "Order Placed");
-    } catch (e: any) {}
+      setShowSuccessModal(true);
+    } catch (e: any) {
+      Alert.alert("Order Failed", e.message);
+    } finally {
+      setPlacingOrder(false);
+    }
   };
 
-  // --- CALCULATIONS ---
+  // --- CALCULATIONS & FORMATTERS ---
+  const formatPrice = (value: any) => {
+    const num = parseFloat(value);
+    return isNaN(num) ? "0.00" : num.toFixed(2);
+  };
+
+  const calculateItemTotal = (item: any) => {
+    const price = item.unit_price || item.price || 0;
+    const qty = item.quantity || item.qty || 0;
+    const num = parseFloat(price);
+    return isNaN(num) ? "0.00" : (num * qty).toFixed(2);
+  };
+
   const updateCart = (id: number, delta: number) => {
     setCart((prev) => {
       const n = (prev[id] || 0) + delta;
@@ -394,14 +405,20 @@ export default function Menu() {
     return { items, totalQty: q, totalPrice: p };
   }, [cart, menu]);
 
-  const grandTotal = useMemo(
-    () => orders.reduce((s, o) => s + parseFloat(o.total_amount), 0),
-    [orders],
-  );
+  const activeOrders = useMemo(() => {
+    return orders.filter((order) => order.status.toLowerCase() !== "cancelled");
+  }, [orders]);
+
+  const grandTotal = useMemo(() => {
+    return activeOrders.reduce(
+      (sum, order) => sum + parseFloat(order.total_amount),
+      0,
+    );
+  }, [activeOrders]);
 
   // ================= RENDER =================
 
-  if (loading)
+  if (loading && !menu && nameSubmitted)
     return (
       <View style={styles.centerContainer}>
         <ActivityIndicator size="large" color={THEME.primary} />
@@ -468,10 +485,10 @@ export default function Menu() {
       <SafeAreaView style={{ flex: 1, backgroundColor: "white" }}>
         <View style={styles.authContainer}>
           <Text style={styles.authEmoji}>🍽️</Text>
+          <Text style={styles.authTitle}>Let's get started</Text>
 
           {showJoinChoice ? (
             <>
-              <Text style={styles.authTitle}>Table is Active</Text>
               <Text style={styles.authSubtitle}>
                 Hosted by{" "}
                 <Text style={{ fontWeight: "bold", color: "black" }}>
@@ -558,19 +575,16 @@ export default function Menu() {
               </View>
             </>
           ) : (
-            <>
-              <Text style={styles.authTitle}>Start Table</Text>
-              <Text style={styles.authSubtitle}>
-                You will be the host for this table.
-              </Text>
-            </>
+            <Text style={styles.authSubtitle}>
+              Enter your name to start ordering.
+            </Text>
           )}
 
           <View style={styles.inputGroup}>
             <Text style={styles.label}>Your Name</Text>
             <TextInput
               style={styles.textInput}
-              placeholder="e.g. John"
+              placeholder="e.g. John Doe"
               value={customerName}
               onChangeText={setCustomerName}
             />
@@ -580,11 +594,15 @@ export default function Menu() {
             style={[styles.primaryBtn, { width: "100%" }]}
             onPress={startSession}
           >
-            <Text style={styles.primaryBtnText}>
-              {showJoinChoice && selectedMode === "join"
-                ? "Request to Join"
-                : "Start Session"}
-            </Text>
+            {loading ? (
+              <ActivityIndicator color="white" />
+            ) : (
+              <Text style={styles.primaryBtnText}>
+                {showJoinChoice && selectedMode === "join"
+                  ? "Request to Join"
+                  : "Start Session"}
+              </Text>
+            )}
           </TouchableOpacity>
         </View>
       </SafeAreaView>
@@ -616,131 +634,427 @@ export default function Menu() {
       </View>
     );
 
-  // 5. MAIN APP UI
+  // 5. MAIN APP UI WITH TABS
   return (
     <View style={styles.container}>
       <StatusBar style="dark" />
+
+      {/* Blurred Background Logo */}
+      <View style={styles.backgroundContainer}>
+        {menu?.restaurant?.logo && (
+          <View style={styles.logoCircleWrapper}>
+            <Image
+              source={{ uri: menu.restaurant.logo }}
+              style={styles.blurredBackgroundLogo}
+            />
+          </View>
+        )}
+      </View>
+
       <SafeAreaView style={styles.safeArea}>
         {/* HEADER */}
         <View style={styles.header}>
-          <View>
-            <Text style={styles.headerGreeting}>
-              {customerName} {isPrimary && "(Host)"}
+          <View style={{ flex: 1 }}>
+            <Text style={styles.resName}>
+              {menu?.restaurant?.name || "Restaurant"}
             </Text>
-            <Text style={styles.headerSubtitle}>Table {tableId}</Text>
+            <Text style={styles.taglineText}>
+              Eating is the best experience
+            </Text>
+            <Text style={styles.tableInfo}>
+              Table: {tableId} • {customerName} {isPrimary && "(Host)"}
+            </Text>
           </View>
-          <View style={{ flexDirection: "row", gap: 10 }}>
+
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+            {/* Host Requests Icon */}
             {isPrimary && (
               <TouchableOpacity
                 style={[
                   styles.billBtnHeader,
                   {
                     backgroundColor:
-                      pendingRequests.length > 0
-                        ? THEME.danger
-                        : THEME.secondary,
+                      pendingRequests.length > 0 ? THEME.danger : THEME.primary,
                   },
                 ]}
                 onPress={() => setShowRequestsModal(true)}
               >
                 <Ionicons name="people" size={16} color="white" />
                 <Text
-                  style={{ color: "white", fontWeight: "bold", marginLeft: 4 }}
+                  style={{
+                    color: "white",
+                    fontWeight: "bold",
+                    marginLeft: 4,
+                    fontSize: 12,
+                  }}
                 >
                   {activeGuests.length + pendingRequests.length}
                 </Text>
               </TouchableOpacity>
             )}
+
+            {/* Header Logo or Logout */}
+            {menu?.restaurant?.logo ? (
+              <Image
+                source={{ uri: menu.restaurant.logo }}
+                style={styles.headerLogo}
+              />
+            ) : null}
             <TouchableOpacity
               style={[styles.billBtnHeader, { backgroundColor: "#636E72" }]}
-              onPress={clearSession}
+              onPress={() =>
+                Alert.alert("Leave Table?", "This will clear your session.", [
+                  { text: "Cancel", style: "cancel" },
+                  {
+                    text: "Leave",
+                    style: "destructive",
+                    onPress: clearSession,
+                  },
+                ])
+              }
             >
               <Ionicons name="log-out-outline" size={18} color="white" />
             </TouchableOpacity>
-            {orders.length > 0 && (
-              <TouchableOpacity
-                style={styles.billBtnHeader}
-                onPress={() => setShowTotalBill(true)}
-              >
-                <Ionicons
-                  name="receipt-outline"
-                  size={16}
-                  color="white"
-                  style={{ marginRight: 4 }}
-                />
-                <Text style={{ color: "white", fontWeight: "bold" }}>
-                  ₹{grandTotal.toFixed(0)}
-                </Text>
-              </TouchableOpacity>
-            )}
           </View>
         </View>
 
-        {/* MENU LIST */}
-        <ScrollView contentContainerStyle={styles.scrollContent}>
-          {menu.categories.map((cat: any) => (
-            <View key={cat.id} style={styles.section}>
-              <Text style={styles.categoryTitle}>{cat.name}</Text>
-              {cat.items.map((item: any) => (
-                <View key={item.id} style={styles.menuItemCard}>
-                  <View style={styles.itemInfo}>
-                    <Text style={styles.itemName}>{item.name}</Text>
-                    <Text style={styles.itemDescription} numberOfLines={2}>
-                      {item.description}
-                    </Text>
-                    <Text style={styles.itemPrice}>₹{item.price}</Text>
-                  </View>
-                  <View style={styles.qtyContainer}>
-                    {cart[item.id] ? (
-                      <View style={styles.qtySelector}>
-                        <TouchableOpacity
-                          onPress={() => updateCart(item.id, -1)}
-                          style={styles.qtyBtn}
-                        >
-                          <Ionicons
-                            name="remove"
-                            size={16}
-                            color={THEME.primary}
-                          />
-                        </TouchableOpacity>
-                        <Text style={styles.qtyText}>{cart[item.id]}</Text>
-                        <TouchableOpacity
-                          onPress={() => updateCart(item.id, 1)}
-                          style={styles.qtyBtn}
-                        >
-                          <Ionicons
-                            name="add"
-                            size={16}
-                            color={THEME.primary}
-                          />
-                        </TouchableOpacity>
+        {/* SCROLLABLE CONTENT AREA */}
+        <ScrollView
+          contentContainerStyle={styles.scrollContent}
+          showsVerticalScrollIndicator={false}
+        >
+          {/* ---- TAB: MENU ---- */}
+          {activeTab === "MENU" && (
+            <View style={styles.section}>
+              {menu.categories.map((cat: any) => (
+                <View key={cat.id} style={{ marginBottom: 25 }}>
+                  <Text style={styles.categoryTitle}>{cat.name}</Text>
+                  {cat.items.map((item: any) => {
+                    const quantity = cart[item.id] || 0;
+                    return (
+                      <View key={item.id} style={styles.menuItemCard}>
+                        <View style={styles.itemInfo}>
+                          <Text style={styles.itemName}>{item.name}</Text>
+                          <Text
+                            style={styles.itemDescription}
+                            numberOfLines={2}
+                          >
+                            {item.description}
+                          </Text>
+                          <Text style={styles.itemPrice}>
+                            ₹{formatPrice(item.price)}
+                          </Text>
+                        </View>
+                        <View style={styles.qtyContainer}>
+                          {quantity > 0 ? (
+                            <View style={styles.qtySelector}>
+                              <TouchableOpacity
+                                onPress={() => updateCart(item.id, -1)}
+                                style={styles.qtyBtn}
+                              >
+                                <Ionicons
+                                  name="remove"
+                                  size={18}
+                                  color={THEME.primary}
+                                />
+                              </TouchableOpacity>
+                              <Text style={styles.qtyText}>{quantity}</Text>
+                              <TouchableOpacity
+                                onPress={() => updateCart(item.id, 1)}
+                                style={styles.qtyBtn}
+                              >
+                                <Ionicons
+                                  name="add"
+                                  size={18}
+                                  color={THEME.primary}
+                                />
+                              </TouchableOpacity>
+                            </View>
+                          ) : (
+                            <TouchableOpacity
+                              onPress={() => updateCart(item.id, 1)}
+                              style={styles.addBtn}
+                            >
+                              <Text style={styles.addBtnText}>ADD</Text>
+                            </TouchableOpacity>
+                          )}
+                        </View>
                       </View>
-                    ) : (
-                      <TouchableOpacity
-                        onPress={() => updateCart(item.id, 1)}
-                        style={styles.addBtn}
-                      >
-                        <Text style={styles.addBtnText}>ADD</Text>
-                      </TouchableOpacity>
-                    )}
-                  </View>
+                    );
+                  })}
                 </View>
               ))}
             </View>
-          ))}
+          )}
+
+          {/* ---- TAB: ORDERS ---- */}
+          {activeTab === "ORDERS" && (
+            <View style={styles.section}>
+              <Text style={styles.categoryTitle}>Your Orders Status</Text>
+              {orders.length === 0 ? (
+                <View style={styles.menuItemCard}>
+                  <Text style={styles.itemDescription}>
+                    No orders placed yet.
+                  </Text>
+                </View>
+              ) : (
+                orders.map((order) => (
+                  <View key={order.id} style={{ marginBottom: 20 }}>
+                    <View
+                      style={[
+                        styles.menuItemCard,
+                        {
+                          flexDirection: "column",
+                          marginBottom: 0,
+                          borderBottomLeftRadius: 0,
+                          borderBottomRightRadius: 0,
+                        },
+                      ]}
+                    >
+                      <View style={styles.orderRow}>
+                        <Text style={styles.itemName}>Order #{order.id}</Text>
+                        <View
+                          style={[
+                            styles.statusBadge,
+                            {
+                              backgroundColor:
+                                order.status === "completed"
+                                  ? "#E3FCEF"
+                                  : order.status === "cancelled"
+                                    ? "#FFE5E5"
+                                    : "#FFF4E5",
+                            },
+                          ]}
+                        >
+                          <Text
+                            style={[
+                              styles.statusText,
+                              {
+                                color:
+                                  order.status === "completed"
+                                    ? "#006644"
+                                    : order.status === "cancelled"
+                                      ? "#CC0000"
+                                      : "#B95000",
+                              },
+                            ]}
+                          >
+                            {order.status.toUpperCase()}
+                          </Text>
+                        </View>
+                      </View>
+                    </View>
+
+                    <View style={styles.inlineOrderDetails}>
+                      {order.items.map((item: any, index: number) => (
+                        <View key={index} style={styles.receiptRow}>
+                          <View style={{ flex: 1 }}>
+                            <Text style={styles.receiptItemName}>
+                              {item.item_name || "Item"}
+                            </Text>
+                            <Text style={styles.receiptItemQty}>
+                              Qty: {item.quantity}
+                            </Text>
+                          </View>
+                          <Text style={styles.receiptItemPrice}>
+                            ₹{calculateItemTotal(item)}
+                          </Text>
+                        </View>
+                      ))}
+                      <View style={styles.divider} />
+                      <View style={styles.orderRow}>
+                        <Text style={styles.receiptTotalLabel}>
+                          Order Total
+                        </Text>
+                        <Text style={styles.receiptTotalValue}>
+                          ₹{formatPrice(order.total_amount)}
+                        </Text>
+                      </View>
+                    </View>
+                  </View>
+                ))
+              )}
+            </View>
+          )}
+
+          {/* ---- TAB: PAYMENT ---- */}
+          {activeTab === "PAYMENT" && (
+            <View style={styles.section}>
+              <Text style={styles.categoryTitle}>Payment & Bill</Text>
+              {activeOrders.length === 0 ? (
+                <View style={styles.menuItemCard}>
+                  <Text style={styles.itemDescription}>
+                    No active bill generated yet. Place an order first!
+                  </Text>
+                </View>
+              ) : (
+                <View
+                  style={[styles.menuItemCard, { flexDirection: "column" }]}
+                >
+                  <Text style={styles.billSectionTitle}>Order Summary</Text>
+                  {activeOrders.map((order) => (
+                    <View key={order.id} style={{ marginBottom: 12 }}>
+                      <Text style={styles.billOrderHeader}>
+                        Order #{order.id}{" "}
+                        {order.customer_name !== customerName
+                          ? `(By ${order.customer_name})`
+                          : ""}
+                      </Text>
+                      {order.items.map((item: any, i: number) => (
+                        <View key={i} style={styles.billRow}>
+                          <Text style={styles.billItemText}>
+                            {item.quantity} x {item.item_name}
+                          </Text>
+                          <Text style={styles.billItemPrice}>
+                            ₹{calculateItemTotal(item)}
+                          </Text>
+                        </View>
+                      ))}
+                    </View>
+                  ))}
+
+                  <View style={styles.divider} />
+
+                  <View style={styles.billRow}>
+                    <Text style={styles.billTotalLabel}>Grand Total</Text>
+                    <Text style={styles.billTotalValue}>
+                      ₹{grandTotal.toFixed(2)}
+                    </Text>
+                  </View>
+
+                  <Text style={styles.billNote}>
+                    Please proceed to the counter to pay or ask your waiter for
+                    assistance.
+                  </Text>
+
+                  <TouchableOpacity
+                    style={styles.requestBillBtn}
+                    onPress={() =>
+                      Alert.alert("Success", "Waiter notified for payment!")
+                    }
+                  >
+                    <Text style={styles.requestBillText}>Pay at Counter</Text>
+                  </TouchableOpacity>
+                </View>
+              )}
+            </View>
+          )}
         </ScrollView>
 
-        {/* CHECKOUT */}
-        {orderData.totalQty > 0 && (
+        {/* FLOATING CHECKOUT BUTTON (Only on MENU Tab) */}
+        {activeTab === "MENU" && orderData.totalQty > 0 && (
           <View style={styles.footerContainer}>
-            <TouchableOpacity style={styles.checkoutBtn} onPress={placeOrder}>
-              <Text style={styles.checkoutText}>
-                {orderData.totalQty} Items | ₹{orderData.totalPrice.toFixed(2)}
+            <TouchableOpacity
+              style={[styles.checkoutBtn, placingOrder && { opacity: 0.7 }]}
+              onPress={placeOrder}
+              disabled={placingOrder}
+            >
+              <View style={styles.checkoutInfo}>
+                <View style={styles.badge}>
+                  {placingOrder ? (
+                    <ActivityIndicator size="small" color="white" />
+                  ) : (
+                    <Text style={styles.badgeText}>{orderData.totalQty}</Text>
+                  )}
+                </View>
+                <Text style={styles.checkoutText}>
+                  {placingOrder ? "Placing Order..." : "Place Order"}
+                </Text>
+              </View>
+              <Text style={styles.checkoutPrice}>
+                ₹{orderData.totalPrice.toFixed(2)}
               </Text>
-              <Text style={styles.checkoutText}>Place Order</Text>
             </TouchableOpacity>
           </View>
         )}
+
+        {/* BOTTOM TAB BAR */}
+        <View style={styles.tabBar}>
+          <TouchableOpacity
+            onPress={() => setActiveTab("MENU")}
+            style={styles.tab}
+          >
+            <Ionicons
+              name="restaurant-outline"
+              size={22}
+              color={activeTab === "MENU" ? THEME.primary : "#94a3b8"}
+            />
+            <Text
+              style={[
+                styles.tabIcon,
+                activeTab === "MENU" && { color: THEME.primary },
+              ]}
+            >
+              Menu
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => setActiveTab("ORDERS")}
+            style={styles.tab}
+          >
+            <Ionicons
+              name="time-outline"
+              size={22}
+              color={activeTab === "ORDERS" ? THEME.primary : "#94a3b8"}
+            />
+            <Text
+              style={[
+                styles.tabIcon,
+                activeTab === "ORDERS" && { color: THEME.primary },
+              ]}
+            >
+              Status
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => setActiveTab("PAYMENT")}
+            style={styles.tab}
+          >
+            <Ionicons
+              name="card-outline"
+              size={22}
+              color={activeTab === "PAYMENT" ? THEME.primary : "#94a3b8"}
+            />
+            <Text
+              style={[
+                styles.tabIcon,
+                activeTab === "PAYMENT" && { color: THEME.primary },
+              ]}
+            >
+              Payment
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* SUCCESS MODAL */}
+        <Modal visible={showSuccessModal} animationType="fade" transparent>
+          <View style={styles.modalOverlayCenter}>
+            <View style={styles.successModalContent}>
+              <TouchableOpacity
+                style={styles.closeModalBtn}
+                onPress={() => setShowSuccessModal(false)}
+              >
+                <Ionicons name="close" size={24} color={THEME.textSecondary} />
+              </TouchableOpacity>
+              <View style={styles.successIconCircle}>
+                <Ionicons name="checkmark-sharp" size={50} color="white" />
+              </View>
+              <Text style={styles.successTitle}>Thank You!</Text>
+              <Text style={styles.successSubtitle}>
+                Your order has been placed successfully.
+              </Text>
+              <TouchableOpacity
+                style={styles.viewStatusBtn}
+                onPress={() => {
+                  setShowSuccessModal(false);
+                  setActiveTab("ORDERS");
+                }}
+              >
+                <Text style={styles.viewStatusBtnText}>Track Order Status</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
 
         {/* HOST DASHBOARD MODAL */}
         <Modal visible={showRequestsModal} transparent animationType="slide">
@@ -758,7 +1072,6 @@ export default function Menu() {
               </View>
 
               <ScrollView>
-                {/* Pending Requests Section */}
                 <Text style={styles.sectionHeader}>Join Requests</Text>
                 {pendingRequests.length === 0 ? (
                   <Text style={styles.emptyText}>No pending requests.</Text>
@@ -790,7 +1103,6 @@ export default function Menu() {
                   ))
                 )}
 
-                {/* Active Guests Section */}
                 <Text style={[styles.sectionHeader, { marginTop: 20 }]}>
                   Active Guests
                 </Text>
@@ -817,97 +1129,9 @@ export default function Menu() {
                           {g.customer_name}
                         </Text>
                       </View>
-                      {/* Optional: Host can kick guest out here in future */}
                     </View>
                   ))
                 )}
-              </ScrollView>
-            </View>
-          </View>
-        </Modal>
-
-        {/* BILL MODAL */}
-        <Modal visible={showTotalBill} transparent animationType="slide">
-          <View style={styles.modalOverlay}>
-            <View style={styles.modalContent}>
-              <View style={styles.modalHeader}>
-                <Text style={styles.modalTitle}>Total Bill</Text>
-                <TouchableOpacity onPress={() => setShowTotalBill(false)}>
-                  <Ionicons
-                    name="close-circle"
-                    size={28}
-                    color={THEME.textSecondary}
-                  />
-                </TouchableOpacity>
-              </View>
-              <ScrollView>
-                {orders.map((o) => (
-                  <View
-                    key={o.id}
-                    style={{
-                      marginBottom: 15,
-                      paddingBottom: 15,
-                      borderBottomWidth: 1,
-                      borderColor: "#eee",
-                    }}
-                  >
-                    <View
-                      style={{
-                        flexDirection: "row",
-                        justifyContent: "space-between",
-                        marginBottom: 5,
-                      }}
-                    >
-                      <Text
-                        style={{ fontWeight: "bold", color: THEME.primary }}
-                      >
-                        Order #{o.id}
-                      </Text>
-                      <Text
-                        style={{ fontSize: 12, color: THEME.textSecondary }}
-                      >
-                        By {o.customer_name}
-                      </Text>
-                    </View>
-                    {o.items.map((i: any, idx: number) => (
-                      <View
-                        key={idx}
-                        style={{
-                          flexDirection: "row",
-                          justifyContent: "space-between",
-                          marginTop: 4,
-                        }}
-                      >
-                        <Text style={{ color: THEME.textPrimary }}>
-                          {i.quantity} x {i.item_name}
-                        </Text>
-                        <Text style={{ fontWeight: "500" }}>
-                          ₹{i.quantity * i.unit_price}
-                        </Text>
-                      </View>
-                    ))}
-                  </View>
-                ))}
-                <View
-                  style={{
-                    flexDirection: "row",
-                    justifyContent: "space-between",
-                    marginTop: 10,
-                  }}
-                >
-                  <Text style={{ fontSize: 22, fontWeight: "bold" }}>
-                    Grand Total
-                  </Text>
-                  <Text
-                    style={{
-                      fontSize: 22,
-                      fontWeight: "bold",
-                      color: THEME.primary,
-                    }}
-                  >
-                    ₹{grandTotal}
-                  </Text>
-                </View>
               </ScrollView>
             </View>
           </View>
@@ -926,84 +1150,288 @@ const styles = StyleSheet.create({
     alignItems: "center",
     padding: 20,
   },
+
+  // Background Styling
+  backgroundContainer: {
+    position: "absolute",
+    inset: 0,
+    justifyContent: "center",
+    alignItems: "center",
+    zIndex: -1,
+  },
+  logoCircleWrapper: {
+    width: width * 0.7,
+    height: width * 0.7,
+    borderRadius: (width * 0.7) / 2,
+    backgroundColor: "rgba(255,255,255,0.4)",
+    justifyContent: "center",
+    alignItems: "center",
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: "rgba(27, 152, 235, 0.1)",
+  },
+  blurredBackgroundLogo: {
+    width: "80%",
+    height: "80%",
+    resizeMode: "contain",
+    opacity: 0.15,
+  },
+
+  // Header Styling
   header: {
     flexDirection: "row",
-    justifyContent: "space-between",
     alignItems: "center",
-    padding: 15,
+    paddingHorizontal: 20,
+    paddingVertical: 15,
     backgroundColor: "white",
     borderBottomWidth: 1,
-    borderColor: "#eee",
+    borderBottomColor: "#F0F0F0",
   },
-  headerGreeting: { fontSize: 18, fontWeight: "bold" },
-  headerSubtitle: { color: "gray" },
+  resName: { fontSize: 22, fontWeight: "900", color: "#0369a1" },
+  taglineText: {
+    fontSize: 12,
+    color: "#0ea5e9",
+    fontStyle: "italic",
+    fontWeight: "600",
+  },
+  tableInfo: {
+    fontSize: 11,
+    color: "#64748b",
+    fontWeight: "700",
+    textTransform: "uppercase",
+    marginTop: 2,
+  },
+  headerLogo: {
+    width: 40,
+    height: 40,
+    borderRadius: 8,
+    backgroundColor: "#f8fafc",
+  },
   billBtnHeader: {
-    paddingHorizontal: 12,
+    paddingHorizontal: 10,
     paddingVertical: 8,
-    borderRadius: 20,
+    borderRadius: 10,
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: THEME.primary,
+    justifyContent: "center",
   },
-  scrollContent: { padding: 15, paddingBottom: 100 },
-  section: { marginBottom: 20 },
-  categoryTitle: { fontSize: 20, fontWeight: "bold", marginBottom: 10 },
+
+  // Tab Bar
+  tabBar: {
+    height: 70,
+    backgroundColor: "#fff",
+    flexDirection: "row",
+    borderTopWidth: 1,
+    borderTopColor: "#F0F0F0",
+    paddingBottom: 5,
+  },
+  tab: { flex: 1, justifyContent: "center", alignItems: "center" },
+  tabIcon: { fontSize: 11, fontWeight: "800", color: "#94a3b8", marginTop: 4 },
+
+  // Scroll Content
+  scrollContent: { paddingBottom: 120 },
+  section: { marginTop: 20, paddingHorizontal: 20 },
+  categoryTitle: {
+    fontSize: 20,
+    fontWeight: "800",
+    color: THEME.textPrimary,
+    marginBottom: 15,
+    textTransform: "uppercase",
+  },
+
+  // Menu Item Card
   menuItemCard: {
     flexDirection: "row",
     backgroundColor: "white",
     padding: 15,
-    borderRadius: 12,
-    marginBottom: 10,
+    borderRadius: 16,
+    marginBottom: 15,
+    elevation: 2,
     shadowColor: "#000",
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.05,
     shadowRadius: 4,
-    elevation: 2,
   },
   itemInfo: { flex: 1, paddingRight: 10 },
-  itemName: { fontSize: 16, fontWeight: "bold", marginBottom: 4 },
-  itemDescription: { color: "gray", fontSize: 12, marginBottom: 6 },
-  itemPrice: { fontWeight: "bold", color: THEME.textPrimary },
+  itemName: { fontSize: 16, fontWeight: "700" },
+  itemDescription: {
+    fontSize: 13,
+    color: THEME.textSecondary,
+    marginVertical: 4,
+  },
+  itemPrice: { fontSize: 15, fontWeight: "700", color: THEME.primary },
+
+  // Quantity Selector
   qtyContainer: { justifyContent: "center" },
+  addBtn: {
+    backgroundColor: "#f0f9ff",
+    paddingVertical: 8,
+    paddingHorizontal: 15,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: THEME.primary,
+  },
+  addBtnText: { color: THEME.primary, fontWeight: "700" },
   qtySelector: {
     flexDirection: "row",
     alignItems: "center",
     borderWidth: 1,
-    borderColor: "#eee",
+    borderColor: "#E0E0E0",
     borderRadius: 8,
-    padding: 4,
   },
-  qtyBtn: { padding: 4 },
-  qtyText: { marginHorizontal: 10, fontWeight: "bold" },
-  addBtn: {
-    backgroundColor: "#fff0f0",
-    paddingVertical: 8,
-    paddingHorizontal: 16,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: "#FFDCDC",
-  },
-  addBtnText: { color: THEME.primary, fontWeight: "bold" },
-  footerContainer: {
-    position: "absolute",
-    bottom: 0,
-    left: 0,
-    right: 0,
-    padding: 20,
-    backgroundColor: "white",
-    borderTopWidth: 1,
-    borderColor: "#eee",
-  },
+  qtyBtn: { padding: 8 },
+  qtyText: { marginHorizontal: 5, fontWeight: "600" },
+
+  // Floating Footer (Checkout)
+  footerContainer: { position: "absolute", bottom: 85, left: 20, right: 20 },
   checkoutBtn: {
     backgroundColor: THEME.primary,
-    padding: 15,
-    borderRadius: 12,
     flexDirection: "row",
     justifyContent: "space-between",
+    alignItems: "center",
+    padding: 16,
+    borderRadius: 15,
+    elevation: 5,
   },
-  checkoutText: { color: "white", fontWeight: "bold", fontSize: 16 },
+  checkoutInfo: { flexDirection: "row", alignItems: "center" },
+  badge: {
+    backgroundColor: "rgba(0,0,0,0.2)",
+    paddingHorizontal: 8,
+    borderRadius: 5,
+    marginRight: 10,
+    minWidth: 28,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  badgeText: { color: "white", fontWeight: "bold" },
+  checkoutText: { color: "white", fontWeight: "700" },
+  checkoutPrice: { color: "white", fontWeight: "800", fontSize: 17 },
 
-  // Modals
+  // Inline Orders Tab Styles
+  orderRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    width: "100%",
+    alignItems: "center",
+    marginBottom: 4,
+  },
+  statusBadge: { paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 },
+  statusText: { fontSize: 10, fontWeight: "700" },
+  inlineOrderDetails: {
+    backgroundColor: "#FFFFFF",
+    padding: 15,
+    borderBottomLeftRadius: 16,
+    borderBottomRightRadius: 16,
+    borderWidth: 1,
+    borderTopWidth: 0,
+    borderColor: "#F0F0F0",
+    elevation: 1,
+    marginTop: -5,
+  },
+  receiptRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginBottom: 10,
+  },
+  receiptItemName: {
+    fontWeight: "600",
+    fontSize: 14,
+    color: THEME.textPrimary,
+  },
+  receiptItemQty: { fontSize: 12, color: THEME.textSecondary },
+  receiptItemPrice: { fontWeight: "600", fontSize: 14 },
+  divider: { height: 1, backgroundColor: "#EFEFEF", marginVertical: 10 },
+  receiptTotalLabel: { fontSize: 16, fontWeight: "bold" },
+  receiptTotalValue: { fontSize: 16, fontWeight: "bold", color: THEME.primary },
+
+  // Payment Tab Styles
+  billSectionTitle: {
+    fontSize: 16,
+    fontWeight: "800",
+    marginBottom: 15,
+    color: THEME.textPrimary,
+  },
+  billOrderHeader: {
+    fontWeight: "bold",
+    color: THEME.primary,
+    marginBottom: 5,
+    fontSize: 14,
+  },
+  billRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginBottom: 5,
+  },
+  billItemText: { fontSize: 14, color: THEME.textSecondary },
+  billItemPrice: { fontWeight: "600", color: THEME.textPrimary },
+  billTotalLabel: { fontSize: 20, fontWeight: "800" },
+  billTotalValue: { fontSize: 20, fontWeight: "800", color: THEME.primary },
+  billNote: {
+    textAlign: "center",
+    color: "#999",
+    fontSize: 12,
+    marginTop: 15,
+    fontStyle: "italic",
+  },
+  requestBillBtn: {
+    backgroundColor: "black",
+    padding: 16,
+    borderRadius: 12,
+    marginTop: 20,
+    alignItems: "center",
+  },
+  requestBillText: { color: "white", fontWeight: "bold", fontSize: 16 },
+
+  // Center Screen Modal (Success)
+  modalOverlayCenter: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.7)",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 20,
+  },
+  successModalContent: {
+    backgroundColor: "white",
+    width: "90%",
+    borderRadius: 24,
+    padding: 30,
+    alignItems: "center",
+    position: "relative",
+  },
+  closeModalBtn: { position: "absolute", top: 15, right: 15 },
+  successIconCircle: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: THEME.success,
+    justifyContent: "center",
+    alignItems: "center",
+    marginBottom: 20,
+  },
+  successTitle: {
+    fontSize: 24,
+    fontWeight: "900",
+    color: THEME.textPrimary,
+    marginBottom: 10,
+  },
+  successSubtitle: {
+    fontSize: 15,
+    color: THEME.textSecondary,
+    textAlign: "center",
+    marginBottom: 30,
+    lineHeight: 22,
+  },
+  viewStatusBtn: {
+    backgroundColor: THEME.primary,
+    paddingVertical: 15,
+    paddingHorizontal: 25,
+    borderRadius: 12,
+    width: "100%",
+    alignItems: "center",
+  },
+  viewStatusBtnText: { color: "white", fontWeight: "bold", fontSize: 16 },
+
+  // Bottom Modals (Host Requests)
   modalOverlay: {
     flex: 1,
     backgroundColor: "rgba(0,0,0,0.5)",
@@ -1045,30 +1473,29 @@ const styles = StyleSheet.create({
   requestName: { fontSize: 16, fontWeight: "600" },
   actionBtn: { padding: 8, borderRadius: 8 },
 
-  // Auth Screen
-  authContainer: { flex: 1, justifyContent: "center", padding: 30 },
-  authEmoji: { fontSize: 50, marginBottom: 15 },
-  authTitle: { fontSize: 28, fontWeight: "bold", marginBottom: 5 },
-  authSubtitle: { fontSize: 15, color: THEME.textSecondary, marginBottom: 20 },
-  inputGroup: { width: "100%", marginBottom: 20 },
-  label: { fontWeight: "bold", marginBottom: 8, color: THEME.textPrimary },
+  // Auth/Login Screen & Split Logic UI
+  authContainer: { flex: 1, justifyContent: "center", padding: 25 },
+  authEmoji: { fontSize: 50, marginBottom: 10 },
+  authTitle: { fontSize: 28, fontWeight: "800", marginBottom: 5 },
+  authSubtitle: { color: "gray", marginBottom: 30, fontSize: 15 },
+  inputGroup: { marginBottom: 20, width: "100%" },
+  label: { fontWeight: "600", marginBottom: 8 },
   textInput: {
     borderWidth: 1,
-    borderColor: "#E0E0E0",
+    borderColor: "#ddd",
+    borderRadius: 10,
     padding: 15,
-    borderRadius: 12,
+    backgroundColor: "#f9f9f9",
     fontSize: 16,
-    backgroundColor: "#FAFAFA",
   },
   primaryBtn: {
     backgroundColor: THEME.primary,
-    padding: 16,
+    padding: 18,
     borderRadius: 12,
     alignItems: "center",
   },
   primaryBtnText: { color: "white", fontWeight: "bold", fontSize: 16 },
 
-  // Choice UI
   choiceBtn: {
     flexDirection: "row",
     alignItems: "center",
@@ -1079,8 +1506,8 @@ const styles = StyleSheet.create({
     gap: 15,
   },
   choiceBtnActive: {
-    backgroundColor: THEME.secondary,
-    borderColor: THEME.secondary,
+    backgroundColor: THEME.primary,
+    borderColor: THEME.primary,
   },
   choiceTitle: { fontWeight: "bold", fontSize: 16, marginBottom: 2 },
   choiceDesc: { fontSize: 13, color: THEME.textSecondary },
