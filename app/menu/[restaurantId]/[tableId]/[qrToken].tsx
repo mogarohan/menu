@@ -39,45 +39,42 @@ export default function Menu() {
   // --- STATE ---
   const [customerName, setCustomerName] = useState("");
   const [nameSubmitted, setNameSubmitted] = useState(false);
-
   const [sessionToken, setSessionToken] = useState<string | null>(null);
   const [isPrimary, setIsPrimary] = useState(false);
   const [joinStatus, setJoinStatus] = useState<
     "active" | "pending" | "approved" | "rejected" | null
   >(null);
 
+  // Join vs Split UI State
+  const [existingHostName, setExistingHostName] = useState<string | null>(null);
+  const [showJoinChoice, setShowJoinChoice] = useState(false);
+  const [selectedMode, setSelectedMode] = useState<"new" | "join">("new");
+
   const [menu, setMenu] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [cart, setCart] = useState<Record<number, number>>({});
   const [orders, setOrders] = useState<any[]>([]);
 
+  // Host UI State
   const [showTotalBill, setShowTotalBill] = useState(false);
   const [pendingRequests, setPendingRequests] = useState<any[]>([]);
+  const [activeGuests, setActiveGuests] = useState<any[]>([]); // To show who joined
   const [showRequestsModal, setShowRequestsModal] = useState(false);
 
   // --- 1. RESET HELPER ---
-  // --- 1. RESET HELPER (FIXED) ---
   const clearSession = async () => {
     try {
-      // 🔥 STEP 1: Tell Backend to Deactivate Session 🔥
       if (sessionToken) {
-        // "Fire and forget" - we don't need to wait for the result
         await fetch(`${BASE_URL}/qr/session/leave`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ session_token: sessionToken }),
         });
       }
-    } catch (e) {
-      console.log("Error notifying backend:", e);
-    }
 
-    try {
-      // STEP 2: Clear Local Data
       const key = `session_${restaurantId}_${tableId}`;
       await AsyncStorage.removeItem(key);
 
-      // STEP 3: Reset State
       setSessionToken(null);
       setCustomerName("");
       setNameSubmitted(false);
@@ -85,10 +82,31 @@ export default function Menu() {
       setOrders([]);
       setIsPrimary(false);
       setJoinStatus(null);
-      setLoading(false);
+
+      // 🔥 FIX 1: Fetch fresh table status immediately after leaving so "Join/Split" works
+      await checkTableStatus();
     } catch (e) {
       console.error(e);
     }
+  };
+
+  // --- HELPER: CHECK IF TABLE HAS HOST ---
+  const checkTableStatus = async () => {
+    try {
+      const res = await fetch(
+        `${BASE_URL}/qr/validate/${restaurantId}/${tableId}/${qrToken}`,
+      );
+      const data = await res.json();
+
+      if (data.has_active_host) {
+        setExistingHostName(data.host_name);
+        setShowJoinChoice(true);
+        setSelectedMode("join"); // Suggest join by default
+      } else {
+        setShowJoinChoice(false);
+        setSelectedMode("new");
+      }
+    } catch (e) {}
   };
 
   // --- 2. INITIAL LOAD ---
@@ -103,45 +121,40 @@ export default function Menu() {
         const stored = await AsyncStorage.getItem(key);
 
         if (!stored) {
+          // No session? Check if table has a host so we can show Join/Split UI
+          await checkTableStatus();
           setLoading(false);
           return;
         }
 
         const parsed = JSON.parse(stored);
-
-        // Validate session with backend
         const res = await fetch(
           `${BASE_URL}/menu/${restaurantId}/${tableId}/${qrToken}?session_token=${parsed.session_token}`,
         );
 
-        // 🛑 STRICT CHECK: If error code, check if rejected
         if (!res.ok) {
-          // If it's a 403, it might be pending OR rejected
           if (res.status === 403) {
             try {
               const err = await res.json();
               if (err.join_status === "rejected") {
-                // IT IS REJECTED. Set state and STOP loading.
                 setJoinStatus("rejected");
                 setNameSubmitted(true);
                 setLoading(false);
                 return;
               }
-              // If it is 'pending', we allow it to proceed to the "Waiting" screen
+              // If it's pending, let it proceed to restore state
             } catch (e) {
               await clearSession();
               return;
             }
           } else {
-            // 401 or 404 means dead session -> Clear it
             await clearSession();
             return;
           }
         }
 
+        // Restore Success
         const data = await res.json();
-
-        // Restore State
         setSessionToken(parsed.session_token);
         setCustomerName(parsed.customer_name);
 
@@ -179,7 +192,7 @@ export default function Menu() {
     let interval: NodeJS.Timeout;
 
     if (isPrimary) {
-      interval = setInterval(fetchPendingJoinRequests, 5000);
+      interval = setInterval(fetchHostTableData, 5000);
     } else if (joinStatus === "pending") {
       interval = setInterval(checkMySessionStatus, 3000);
     }
@@ -189,6 +202,7 @@ export default function Menu() {
 
   // --- 4. API ACTIONS ---
 
+  // 🔥 FIX 2: Correctly read 403 Pending vs Rejected 🔥
   const checkMySessionStatus = async () => {
     try {
       const res = await fetch(
@@ -196,40 +210,27 @@ export default function Menu() {
       );
 
       if (res.ok) {
-        // APPROVED
         const data = await res.json();
         setMenu(data);
         setJoinStatus("approved");
 
-        // Update Local Storage
         const key = `session_${restaurantId}_${tableId}`;
         const stored = await AsyncStorage.getItem(key);
         if (stored) {
           const parsed = JSON.parse(stored);
           parsed.join_status = "approved";
-          parsed.is_primary = data.session.is_primary;
           await AsyncStorage.setItem(key, JSON.stringify(parsed));
         }
-
-        Alert.alert("Approved", "You can now order!");
-      } else {
-        // 🔴 REJECTION LOGIC
-        // If we get an error, we assume rejected UNLESS the backend explicitly says "pending"
-        let isStillPending = false;
-
-        if (res.status === 403) {
-          try {
-            const data = await res.json();
-            if (data.join_status === "pending") {
-              isStillPending = true; // Still waiting
-            }
-          } catch (e) {}
-        }
-
-        // If it is NOT pending, it implies REJECTION.
-        if (!isStillPending) {
+      } else if (res.status === 403) {
+        // Read JSON to check if still pending
+        const data = await res.json();
+        if (data.join_status === "rejected") {
           setJoinStatus("rejected");
         }
+        // If data.join_status is "pending", it simply does nothing and keeps waiting.
+      } else if (res.status === 401 || res.status === 404) {
+        // Session destroyed entirely
+        setJoinStatus("rejected");
       }
     } catch (e) {}
   };
@@ -250,7 +251,10 @@ export default function Menu() {
             "Content-Type": "application/json",
             Accept: "application/json",
           },
-          body: JSON.stringify({ customer_name: customerName }),
+          body: JSON.stringify({
+            customer_name: customerName,
+            mode: selectedMode, // 'new' or 'join'
+          }),
         },
       );
 
@@ -262,6 +266,7 @@ export default function Menu() {
       setIsPrimary(data.is_primary);
       setJoinStatus(data.join_status);
       setNameSubmitted(true);
+      setShowJoinChoice(false);
 
       await AsyncStorage.setItem(
         key,
@@ -293,12 +298,8 @@ export default function Menu() {
       const res = await fetch(
         `${BASE_URL}/menu/${restaurantId}/${tableId}/${qrToken}?session_token=${token}`,
       );
-      if (!res.ok) throw new Error("Menu Load Failed");
-      const data = await res.json();
-      setMenu(data);
-    } catch (err) {
-      console.log(err);
-    }
+      if (res.ok) setMenu(await res.json());
+    } catch (err) {}
   };
 
   const fetchOrders = async (token: string) => {
@@ -308,13 +309,19 @@ export default function Menu() {
     } catch (err) {}
   };
 
-  const fetchPendingJoinRequests = async () => {
+  // 🔥 FIX 3: Host fetches pending AND active guests
+  const fetchHostTableData = async () => {
     try {
       const res = await fetch(`${BASE_URL}/table/${tableId}/pending-requests`);
       if (res.ok) {
         const data = await res.json();
-        setPendingRequests(data);
-        if (data.length > 0 && !showRequestsModal) setShowRequestsModal(true);
+        setPendingRequests(data.pending || []);
+        setActiveGuests(data.guests || []);
+
+        // Auto-open modal if there is a NEW pending request
+        if (data.pending?.length > 0 && !showRequestsModal) {
+          setShowRequestsModal(true);
+        }
       }
     } catch (e) {}
   };
@@ -326,11 +333,10 @@ export default function Menu() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action }),
       });
-      setPendingRequests((prev) => prev.filter((p) => p.id !== id));
+      // Refresh list immediately
+      fetchHostTableData();
       if (pendingRequests.length <= 1) setShowRequestsModal(false);
-    } catch (e) {
-      Alert.alert("Error", "Network Error");
-    }
+    } catch (e) {}
   };
 
   const placeOrder = async () => {
@@ -356,11 +362,10 @@ export default function Menu() {
       setCart({});
       fetchOrders(sessionToken);
       Alert.alert("Success", "Order Placed");
-    } catch (e: any) {
-      Alert.alert("Error", e.message);
-    }
+    } catch (e: any) {}
   };
 
+  // --- CALCULATIONS ---
   const updateCart = (id: number, delta: number) => {
     setCart((prev) => {
       const n = (prev[id] || 0) + delta;
@@ -394,51 +399,21 @@ export default function Menu() {
     [orders],
   );
 
-  // ==================== VIEW RENDER LOGIC ====================
+  // ================= RENDER =================
 
-  // 1. GLOBAL LOADING (Initial check)
   if (loading)
     return (
       <View style={styles.centerContainer}>
         <ActivityIndicator size="large" color={THEME.primary} />
-        <Text style={{ marginTop: 15, color: THEME.textSecondary }}>
-          Connecting...
-        </Text>
       </View>
     );
 
-  // 2. LOGIN SCREEN (No user name)
-  if (!nameSubmitted)
-    return (
-      <SafeAreaView style={styles.safeArea}>
-        <View style={styles.authContainer}>
-          <Text style={styles.authEmoji}>🍽️</Text>
-          <Text style={styles.authTitle}>Join Table</Text>
-          <View style={styles.inputGroup}>
-            <Text style={styles.label}>Your Name</Text>
-            <TextInput
-              style={styles.textInput}
-              placeholder="Enter your name"
-              value={customerName}
-              onChangeText={setCustomerName}
-            />
-          </View>
-          <TouchableOpacity style={styles.primaryBtn} onPress={startSession}>
-            <Text style={styles.primaryBtnText}>Join</Text>
-          </TouchableOpacity>
-        </View>
-      </SafeAreaView>
-    );
-
-  // 3. REJECTED SCREEN (🔥 PRIORITY OVER MENU 🔥)
-  // This must be checked BEFORE the menu check to avoid showing the loading spinner.
+  // 1. REJECTED SCREEN
   if (joinStatus === "rejected")
     return (
       <View style={styles.centerContainer}>
         <Ionicons name="close-circle" size={80} color={THEME.danger} />
-        <Text style={[styles.authTitle, { marginTop: 20 }]}>
-          Request Rejected
-        </Text>
+        <Text style={[styles.authTitle, { marginTop: 20 }]}>Access Denied</Text>
         <Text
           style={{
             color: THEME.textSecondary,
@@ -450,12 +425,12 @@ export default function Menu() {
           The Host has declined your request to join this table.
         </Text>
         <TouchableOpacity onPress={clearSession} style={styles.primaryBtn}>
-          <Text style={styles.primaryBtnText}>Try Again</Text>
+          <Text style={styles.primaryBtnText}>Start Over</Text>
         </TouchableOpacity>
       </View>
     );
 
-  // 4. PENDING (WAITING ROOM)
+  // 2. WAITING ROOM
   if (joinStatus === "pending")
     return (
       <View style={styles.centerContainer}>
@@ -468,8 +443,11 @@ export default function Menu() {
             paddingHorizontal: 30,
           }}
         >
-          Waiting for host to approve{" "}
-          <Text style={{ fontWeight: "bold" }}>{customerName}</Text>
+          Waiting for{" "}
+          <Text style={{ fontWeight: "bold" }}>
+            {existingHostName || "Host"}
+          </Text>{" "}
+          to approve you.
         </Text>
         <TouchableOpacity onPress={clearSession} style={{ marginTop: 30 }}>
           <Text
@@ -484,8 +462,135 @@ export default function Menu() {
       </View>
     );
 
-  // 5. LOADING MENU (Fallback)
-  // Only show this if we are NOT rejected, NOT pending, but menu is still null
+  // 3. DECISION SCREEN / LOGIN
+  if (!nameSubmitted)
+    return (
+      <SafeAreaView style={{ flex: 1, backgroundColor: "white" }}>
+        <View style={styles.authContainer}>
+          <Text style={styles.authEmoji}>🍽️</Text>
+
+          {showJoinChoice ? (
+            <>
+              <Text style={styles.authTitle}>Table is Active</Text>
+              <Text style={styles.authSubtitle}>
+                Hosted by{" "}
+                <Text style={{ fontWeight: "bold", color: "black" }}>
+                  {existingHostName}
+                </Text>
+                . How do you want to order?
+              </Text>
+
+              <View
+                style={{
+                  gap: 15,
+                  width: "100%",
+                  marginTop: 10,
+                  marginBottom: 20,
+                }}
+              >
+                {/* Option A: JOIN */}
+                <TouchableOpacity
+                  style={[
+                    styles.choiceBtn,
+                    selectedMode === "join" && styles.choiceBtnActive,
+                  ]}
+                  onPress={() => setSelectedMode("join")}
+                >
+                  <Ionicons
+                    name="people"
+                    size={28}
+                    color={
+                      selectedMode === "join" ? "white" : THEME.textPrimary
+                    }
+                  />
+                  <View>
+                    <Text
+                      style={[
+                        styles.choiceTitle,
+                        selectedMode === "join" && { color: "white" },
+                      ]}
+                    >
+                      Join the Table
+                    </Text>
+                    <Text
+                      style={[
+                        styles.choiceDesc,
+                        selectedMode === "join" && { color: "white" },
+                      ]}
+                    >
+                      Orders added to {existingHostName}'s bill
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+
+                {/* Option B: SPLIT */}
+                <TouchableOpacity
+                  style={[
+                    styles.choiceBtn,
+                    selectedMode === "new" && styles.choiceBtnActive,
+                  ]}
+                  onPress={() => setSelectedMode("new")}
+                >
+                  <Ionicons
+                    name="receipt"
+                    size={28}
+                    color={selectedMode === "new" ? "white" : THEME.textPrimary}
+                  />
+                  <View>
+                    <Text
+                      style={[
+                        styles.choiceTitle,
+                        selectedMode === "new" && { color: "white" },
+                      ]}
+                    >
+                      Separate Bill
+                    </Text>
+                    <Text
+                      style={[
+                        styles.choiceDesc,
+                        selectedMode === "new" && { color: "white" },
+                      ]}
+                    >
+                      Start your own separate tab
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+              </View>
+            </>
+          ) : (
+            <>
+              <Text style={styles.authTitle}>Start Table</Text>
+              <Text style={styles.authSubtitle}>
+                You will be the host for this table.
+              </Text>
+            </>
+          )}
+
+          <View style={styles.inputGroup}>
+            <Text style={styles.label}>Your Name</Text>
+            <TextInput
+              style={styles.textInput}
+              placeholder="e.g. John"
+              value={customerName}
+              onChangeText={setCustomerName}
+            />
+          </View>
+
+          <TouchableOpacity
+            style={[styles.primaryBtn, { width: "100%" }]}
+            onPress={startSession}
+          >
+            <Text style={styles.primaryBtnText}>
+              {showJoinChoice && selectedMode === "join"
+                ? "Request to Join"
+                : "Start Session"}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      </SafeAreaView>
+    );
+
+  // 4. MAIN MENU SAFETY FALLBACK
   if (!menu)
     return (
       <View style={styles.centerContainer}>
@@ -506,12 +611,12 @@ export default function Menu() {
             borderRadius: 8,
           }}
         >
-          <Text style={{ color: "black" }}>Reset</Text>
+          <Text style={{ color: "black" }}>Start Over</Text>
         </TouchableOpacity>
       </View>
     );
 
-  // 6. MAIN APP RENDER
+  // 5. MAIN APP UI
   return (
     <View style={styles.container}>
       <StatusBar style="dark" />
@@ -525,16 +630,24 @@ export default function Menu() {
             <Text style={styles.headerSubtitle}>Table {tableId}</Text>
           </View>
           <View style={{ flexDirection: "row", gap: 10 }}>
-            {isPrimary && pendingRequests.length > 0 && (
+            {isPrimary && (
               <TouchableOpacity
                 style={[
                   styles.billBtnHeader,
-                  { backgroundColor: THEME.warning },
+                  {
+                    backgroundColor:
+                      pendingRequests.length > 0
+                        ? THEME.danger
+                        : THEME.secondary,
+                  },
                 ]}
                 onPress={() => setShowRequestsModal(true)}
               >
-                <Text style={{ color: "white", fontWeight: "bold" }}>
-                  {pendingRequests.length} Req
+                <Ionicons name="people" size={16} color="white" />
+                <Text
+                  style={{ color: "white", fontWeight: "bold", marginLeft: 4 }}
+                >
+                  {activeGuests.length + pendingRequests.length}
                 </Text>
               </TouchableOpacity>
             )}
@@ -549,7 +662,15 @@ export default function Menu() {
                 style={styles.billBtnHeader}
                 onPress={() => setShowTotalBill(true)}
               >
-                <Text style={{ color: "white" }}>₹{grandTotal.toFixed(0)}</Text>
+                <Ionicons
+                  name="receipt-outline"
+                  size={16}
+                  color="white"
+                  style={{ marginRight: 4 }}
+                />
+                <Text style={{ color: "white", fontWeight: "bold" }}>
+                  ₹{grandTotal.toFixed(0)}
+                </Text>
               </TouchableOpacity>
             )}
           </View>
@@ -564,7 +685,7 @@ export default function Menu() {
                 <View key={item.id} style={styles.menuItemCard}>
                   <View style={styles.itemInfo}>
                     <Text style={styles.itemName}>{item.name}</Text>
-                    <Text style={styles.itemDescription}>
+                    <Text style={styles.itemDescription} numberOfLines={2}>
                       {item.description}
                     </Text>
                     <Text style={styles.itemPrice}>₹{item.price}</Text>
@@ -576,14 +697,22 @@ export default function Menu() {
                           onPress={() => updateCart(item.id, -1)}
                           style={styles.qtyBtn}
                         >
-                          <Ionicons name="remove" size={16} />
+                          <Ionicons
+                            name="remove"
+                            size={16}
+                            color={THEME.primary}
+                          />
                         </TouchableOpacity>
                         <Text style={styles.qtyText}>{cart[item.id]}</Text>
                         <TouchableOpacity
                           onPress={() => updateCart(item.id, 1)}
                           style={styles.qtyBtn}
                         >
-                          <Ionicons name="add" size={16} />
+                          <Ionicons
+                            name="add"
+                            size={16}
+                            color={THEME.primary}
+                          />
                         </TouchableOpacity>
                       </View>
                     ) : (
@@ -606,53 +735,109 @@ export default function Menu() {
           <View style={styles.footerContainer}>
             <TouchableOpacity style={styles.checkoutBtn} onPress={placeOrder}>
               <Text style={styles.checkoutText}>
-                {orderData.totalQty} Items | ₹{orderData.totalPrice}
+                {orderData.totalQty} Items | ₹{orderData.totalPrice.toFixed(2)}
               </Text>
               <Text style={styles.checkoutText}>Place Order</Text>
             </TouchableOpacity>
           </View>
         )}
 
-        {/* MODALS */}
+        {/* HOST DASHBOARD MODAL */}
         <Modal visible={showRequestsModal} transparent animationType="slide">
           <View style={styles.modalOverlay}>
             <View style={styles.modalContent}>
               <View style={styles.modalHeader}>
-                <Text style={styles.modalTitle}>Requests</Text>
+                <Text style={styles.modalTitle}>Table Management</Text>
                 <TouchableOpacity onPress={() => setShowRequestsModal(false)}>
-                  <Ionicons name="close" size={24} />
+                  <Ionicons
+                    name="close-circle"
+                    size={28}
+                    color={THEME.textSecondary}
+                  />
                 </TouchableOpacity>
               </View>
-              {pendingRequests.map((r) => (
-                <View key={r.id} style={styles.requestRow}>
-                  <Text style={styles.requestName}>{r.customer_name}</Text>
-                  <View style={{ flexDirection: "row", gap: 10 }}>
-                    <TouchableOpacity
-                      onPress={() => respondToRequest(r.id, "reject")}
-                      style={[styles.actionBtn, { backgroundColor: "#ffe5e5" }]}
-                    >
-                      <Ionicons name="close" color="red" size={20} />
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                      onPress={() => respondToRequest(r.id, "approve")}
-                      style={[styles.actionBtn, { backgroundColor: "#e5fff5" }]}
-                    >
-                      <Ionicons name="checkmark" color="green" size={20} />
-                    </TouchableOpacity>
-                  </View>
-                </View>
-              ))}
+
+              <ScrollView>
+                {/* Pending Requests Section */}
+                <Text style={styles.sectionHeader}>Join Requests</Text>
+                {pendingRequests.length === 0 ? (
+                  <Text style={styles.emptyText}>No pending requests.</Text>
+                ) : (
+                  pendingRequests.map((r) => (
+                    <View key={r.id} style={styles.requestRow}>
+                      <Text style={styles.requestName}>{r.customer_name}</Text>
+                      <View style={{ flexDirection: "row", gap: 10 }}>
+                        <TouchableOpacity
+                          onPress={() => respondToRequest(r.id, "reject")}
+                          style={[
+                            styles.actionBtn,
+                            { backgroundColor: "#ffe5e5" },
+                          ]}
+                        >
+                          <Ionicons name="close" color="red" size={20} />
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          onPress={() => respondToRequest(r.id, "approve")}
+                          style={[
+                            styles.actionBtn,
+                            { backgroundColor: "#e5fff5" },
+                          ]}
+                        >
+                          <Ionicons name="checkmark" color="green" size={20} />
+                        </TouchableOpacity>
+                      </View>
+                    </View>
+                  ))
+                )}
+
+                {/* Active Guests Section */}
+                <Text style={[styles.sectionHeader, { marginTop: 20 }]}>
+                  Active Guests
+                </Text>
+                {activeGuests.length === 0 ? (
+                  <Text style={styles.emptyText}>
+                    No guests have joined yet.
+                  </Text>
+                ) : (
+                  activeGuests.map((g) => (
+                    <View key={g.id} style={styles.requestRow}>
+                      <View
+                        style={{
+                          flexDirection: "row",
+                          alignItems: "center",
+                          gap: 10,
+                        }}
+                      >
+                        <Ionicons
+                          name="person"
+                          size={16}
+                          color={THEME.success}
+                        />
+                        <Text style={styles.requestName}>
+                          {g.customer_name}
+                        </Text>
+                      </View>
+                      {/* Optional: Host can kick guest out here in future */}
+                    </View>
+                  ))
+                )}
+              </ScrollView>
             </View>
           </View>
         </Modal>
 
+        {/* BILL MODAL */}
         <Modal visible={showTotalBill} transparent animationType="slide">
           <View style={styles.modalOverlay}>
             <View style={styles.modalContent}>
               <View style={styles.modalHeader}>
-                <Text style={styles.modalTitle}>Bill</Text>
+                <Text style={styles.modalTitle}>Total Bill</Text>
                 <TouchableOpacity onPress={() => setShowTotalBill(false)}>
-                  <Ionicons name="close" size={24} />
+                  <Ionicons
+                    name="close-circle"
+                    size={28}
+                    color={THEME.textSecondary}
+                  />
                 </TouchableOpacity>
               </View>
               <ScrollView>
@@ -660,26 +845,69 @@ export default function Menu() {
                   <View
                     key={o.id}
                     style={{
-                      marginBottom: 10,
-                      paddingBottom: 10,
+                      marginBottom: 15,
+                      paddingBottom: 15,
                       borderBottomWidth: 1,
                       borderColor: "#eee",
                     }}
                   >
-                    <Text style={{ fontWeight: "bold" }}>Order #{o.id}</Text>
-                    {o.items.map((i: any, idx: number) => (
-                      <Text key={idx}>
-                        {i.quantity} x {i.item_name} - ₹
-                        {i.quantity * i.unit_price}
+                    <View
+                      style={{
+                        flexDirection: "row",
+                        justifyContent: "space-between",
+                        marginBottom: 5,
+                      }}
+                    >
+                      <Text
+                        style={{ fontWeight: "bold", color: THEME.primary }}
+                      >
+                        Order #{o.id}
                       </Text>
+                      <Text
+                        style={{ fontSize: 12, color: THEME.textSecondary }}
+                      >
+                        By {o.customer_name}
+                      </Text>
+                    </View>
+                    {o.items.map((i: any, idx: number) => (
+                      <View
+                        key={idx}
+                        style={{
+                          flexDirection: "row",
+                          justifyContent: "space-between",
+                          marginTop: 4,
+                        }}
+                      >
+                        <Text style={{ color: THEME.textPrimary }}>
+                          {i.quantity} x {i.item_name}
+                        </Text>
+                        <Text style={{ fontWeight: "500" }}>
+                          ₹{i.quantity * i.unit_price}
+                        </Text>
+                      </View>
                     ))}
                   </View>
                 ))}
-                <Text
-                  style={{ fontSize: 20, fontWeight: "bold", marginTop: 10 }}
+                <View
+                  style={{
+                    flexDirection: "row",
+                    justifyContent: "space-between",
+                    marginTop: 10,
+                  }}
                 >
-                  Total: ₹{grandTotal}
-                </Text>
+                  <Text style={{ fontSize: 22, fontWeight: "bold" }}>
+                    Grand Total
+                  </Text>
+                  <Text
+                    style={{
+                      fontSize: 22,
+                      fontWeight: "bold",
+                      color: THEME.primary,
+                    }}
+                  >
+                    ₹{grandTotal}
+                  </Text>
+                </View>
               </ScrollView>
             </View>
           </View>
@@ -710,9 +938,11 @@ const styles = StyleSheet.create({
   headerGreeting: { fontSize: 18, fontWeight: "bold" },
   headerSubtitle: { color: "gray" },
   billBtnHeader: {
-    padding: 8,
-    borderRadius: 8,
-    marginLeft: 5,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 20,
+    flexDirection: "row",
+    alignItems: "center",
     backgroundColor: THEME.primary,
   },
   scrollContent: { padding: 15, paddingBottom: 100 },
@@ -721,26 +951,38 @@ const styles = StyleSheet.create({
   menuItemCard: {
     flexDirection: "row",
     backgroundColor: "white",
-    padding: 10,
-    borderRadius: 10,
+    padding: 15,
+    borderRadius: 12,
     marginBottom: 10,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.05,
+    shadowRadius: 4,
     elevation: 2,
   },
-  itemInfo: { flex: 1 },
-  itemName: { fontSize: 16, fontWeight: "bold" },
-  itemDescription: { color: "gray", fontSize: 12 },
-  itemPrice: { fontWeight: "bold", marginTop: 5 },
-  qtyContainer: { justifyContent: "center", marginLeft: 10 },
+  itemInfo: { flex: 1, paddingRight: 10 },
+  itemName: { fontSize: 16, fontWeight: "bold", marginBottom: 4 },
+  itemDescription: { color: "gray", fontSize: 12, marginBottom: 6 },
+  itemPrice: { fontWeight: "bold", color: THEME.textPrimary },
+  qtyContainer: { justifyContent: "center" },
   qtySelector: {
     flexDirection: "row",
     alignItems: "center",
     borderWidth: 1,
-    borderColor: "#ddd",
-    borderRadius: 5,
+    borderColor: "#eee",
+    borderRadius: 8,
+    padding: 4,
   },
-  qtyBtn: { padding: 5 },
+  qtyBtn: { padding: 4 },
   qtyText: { marginHorizontal: 10, fontWeight: "bold" },
-  addBtn: { backgroundColor: "#fff0f0", padding: 8, borderRadius: 5 },
+  addBtn: {
+    backgroundColor: "#fff0f0",
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#FFDCDC",
+  },
   addBtnText: { color: THEME.primary, fontWeight: "bold" },
   footerContainer: {
     position: "absolute",
@@ -755,11 +997,13 @@ const styles = StyleSheet.create({
   checkoutBtn: {
     backgroundColor: THEME.primary,
     padding: 15,
-    borderRadius: 10,
+    borderRadius: 12,
     flexDirection: "row",
     justifyContent: "space-between",
   },
-  checkoutText: { color: "white", fontWeight: "bold" },
+  checkoutText: { color: "white", fontWeight: "bold", fontSize: 16 },
+
+  // Modals
   modalOverlay: {
     flex: 1,
     backgroundColor: "rgba(0,0,0,0.5)",
@@ -767,49 +1011,77 @@ const styles = StyleSheet.create({
   },
   modalContent: {
     backgroundColor: "white",
-    borderTopLeftRadius: 20,
-    borderTopRightRadius: 20,
-    padding: 20,
-    maxHeight: "80%",
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    padding: 24,
+    maxHeight: "85%",
   },
   modalHeader: {
     flexDirection: "row",
     justifyContent: "space-between",
+    alignItems: "center",
     marginBottom: 20,
+    paddingBottom: 15,
+    borderBottomWidth: 1,
+    borderColor: "#eee",
   },
   modalTitle: { fontSize: 20, fontWeight: "bold" },
+  sectionHeader: {
+    fontSize: 14,
+    fontWeight: "bold",
+    color: THEME.textSecondary,
+    textTransform: "uppercase",
+    marginBottom: 10,
+  },
+  emptyText: { color: "gray", fontStyle: "italic", paddingVertical: 10 },
   requestRow: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
-    paddingVertical: 10,
+    paddingVertical: 12,
     borderBottomWidth: 1,
-    borderColor: "#eee",
+    borderColor: "#f5f5f5",
   },
-  requestName: { fontSize: 16, fontWeight: "bold" },
-  actionBtn: { padding: 8, borderRadius: 5 },
-  authContainer: { flex: 1, justifyContent: "center", padding: 20 },
-  authEmoji: { fontSize: 50, textAlign: "center", marginBottom: 20 },
-  authTitle: {
-    fontSize: 24,
-    fontWeight: "bold",
-    textAlign: "center",
-    marginBottom: 20,
-  },
-  inputGroup: { marginBottom: 20 },
-  label: { fontWeight: "bold", marginBottom: 5 },
+  requestName: { fontSize: 16, fontWeight: "600" },
+  actionBtn: { padding: 8, borderRadius: 8 },
+
+  // Auth Screen
+  authContainer: { flex: 1, justifyContent: "center", padding: 30 },
+  authEmoji: { fontSize: 50, marginBottom: 15 },
+  authTitle: { fontSize: 28, fontWeight: "bold", marginBottom: 5 },
+  authSubtitle: { fontSize: 15, color: THEME.textSecondary, marginBottom: 20 },
+  inputGroup: { width: "100%", marginBottom: 20 },
+  label: { fontWeight: "bold", marginBottom: 8, color: THEME.textPrimary },
   textInput: {
     borderWidth: 1,
-    borderColor: "#ddd",
-    padding: 10,
-    borderRadius: 10,
+    borderColor: "#E0E0E0",
+    padding: 15,
+    borderRadius: 12,
     fontSize: 16,
+    backgroundColor: "#FAFAFA",
   },
   primaryBtn: {
     backgroundColor: THEME.primary,
-    padding: 15,
-    borderRadius: 10,
+    padding: 16,
+    borderRadius: 12,
     alignItems: "center",
   },
   primaryBtnText: { color: "white", fontWeight: "bold", fontSize: 16 },
+
+  // Choice UI
+  choiceBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    padding: 16,
+    borderRadius: 16,
+    borderWidth: 2,
+    borderColor: "#E0E0E0",
+    gap: 15,
+  },
+  choiceBtnActive: {
+    backgroundColor: THEME.secondary,
+    borderColor: THEME.secondary,
+  },
+  choiceTitle: { fontWeight: "bold", fontSize: 16, marginBottom: 2 },
+  choiceDesc: { fontSize: 13, color: THEME.textSecondary },
 });
