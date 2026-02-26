@@ -8,7 +8,9 @@ import {
   Alert,
   Dimensions,
   Image,
+  KeyboardAvoidingView,
   Modal,
+  Platform,
   SafeAreaView,
   ScrollView,
   StyleSheet,
@@ -21,10 +23,10 @@ import {
 const { width } = Dimensions.get("window");
 
 // ⚠️ CHANGE THIS TO YOUR IP
-const BASE_URL = "http://192.168.1.32:8000/api";
+const BASE_URL = "http://192.168.1.37:8000/api";
 
 const THEME = {
-  primary: "#1b98eb", // Updated to your preferred Blue Theme
+  primary: "#1b98eb",
   secondary: "#2D3436",
   background: "#F8F9FA",
   cardBg: "#FFFFFF",
@@ -57,7 +59,13 @@ export default function Menu() {
   const [menu, setMenu] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [placingOrder, setPlacingOrder] = useState(false);
+
+  // Cart & Notes State
   const [cart, setCart] = useState<Record<number, number>>({});
+  const [itemNotes, setItemNotes] = useState<Record<number, string>>({});
+  const [orderNote, setOrderNote] = useState("");
+  const [showCheckoutModal, setShowCheckoutModal] = useState(false);
+
   const [orders, setOrders] = useState<any[]>([]);
 
   // UI Navigation State
@@ -333,6 +341,7 @@ export default function Menu() {
   const placeOrder = async () => {
     if (placingOrder || !sessionToken || orderData.totalQty === 0) return;
     setPlacingOrder(true);
+
     try {
       const response = await fetch(`${BASE_URL}/orders`, {
         method: "POST",
@@ -341,20 +350,29 @@ export default function Menu() {
           restaurant_id: restaurantId,
           table_id: tableId,
           session_token: sessionToken,
+          notes: orderNote.trim() || null,
           items: orderData.items.map((i) => ({
             menu_item_id: i.id,
             quantity: i.qty,
+            notes: itemNotes[i.id]?.trim() || null,
           })),
         }),
       });
+
       const data = await response.json();
+
       if (response.status === 401 || response.status === 403) {
         await clearSession();
         return Alert.alert("Session Expired", "Please start again.");
       }
-      if (!response.ok) throw new Error(data.message);
+      if (!response.ok)
+        throw new Error(data.message || "Failed to place order.");
 
+      // Reset everything on success
       setCart({});
+      setItemNotes({});
+      setOrderNote("");
+      setShowCheckoutModal(false);
       fetchOrders(sessionToken);
       setShowSuccessModal(true);
     } catch (e: any) {
@@ -382,10 +400,21 @@ export default function Menu() {
       const n = (prev[id] || 0) + delta;
       if (n <= 0) {
         const { [id]: _, ...r } = prev;
+
+        // Remove the note if the item is removed from cart completely
+        setItemNotes((prevNotes) => {
+          const { [id]: __, ...restNotes } = prevNotes;
+          return restNotes;
+        });
+
         return r;
       }
       return { ...prev, [id]: n };
     });
+  };
+
+  const handleItemNoteChange = (id: number, text: string) => {
+    setItemNotes((prev) => ({ ...prev, [id]: text }));
   };
 
   const orderData = useMemo(() => {
@@ -855,12 +884,31 @@ export default function Menu() {
                             <Text style={styles.receiptItemQty}>
                               Qty: {item.quantity}
                             </Text>
+                            {item.notes && (
+                              <Text style={styles.receiptItemNote}>
+                                Note: {item.notes}
+                              </Text>
+                            )}
                           </View>
                           <Text style={styles.receiptItemPrice}>
                             ₹{calculateItemTotal(item)}
                           </Text>
                         </View>
                       ))}
+
+                      {order.notes && (
+                        <View style={styles.receiptOrderNote}>
+                          <Ionicons
+                            name="information-circle-outline"
+                            size={14}
+                            color={THEME.textSecondary}
+                          />
+                          <Text style={styles.receiptOrderNoteText}>
+                            {order.notes}
+                          </Text>
+                        </View>
+                      )}
+
                       <View style={styles.divider} />
                       <View style={styles.orderRow}>
                         <Text style={styles.receiptTotalLabel}>
@@ -945,21 +993,14 @@ export default function Menu() {
         {activeTab === "MENU" && orderData.totalQty > 0 && (
           <View style={styles.footerContainer}>
             <TouchableOpacity
-              style={[styles.checkoutBtn, placingOrder && { opacity: 0.7 }]}
-              onPress={placeOrder}
-              disabled={placingOrder}
+              style={styles.checkoutBtn}
+              onPress={() => setShowCheckoutModal(true)}
             >
               <View style={styles.checkoutInfo}>
                 <View style={styles.badge}>
-                  {placingOrder ? (
-                    <ActivityIndicator size="small" color="white" />
-                  ) : (
-                    <Text style={styles.badgeText}>{orderData.totalQty}</Text>
-                  )}
+                  <Text style={styles.badgeText}>{orderData.totalQty}</Text>
                 </View>
-                <Text style={styles.checkoutText}>
-                  {placingOrder ? "Placing Order..." : "Place Order"}
-                </Text>
+                <Text style={styles.checkoutText}>Review Order</Text>
               </View>
               <Text style={styles.checkoutPrice}>
                 ₹{orderData.totalPrice.toFixed(2)}
@@ -1025,6 +1066,128 @@ export default function Menu() {
             </Text>
           </TouchableOpacity>
         </View>
+
+        {/* --- CHECKOUT MODAL (For Notes) --- */}
+        <Modal visible={showCheckoutModal} animationType="slide" transparent>
+          <KeyboardAvoidingView
+            behavior={Platform.OS === "ios" ? "padding" : undefined}
+            style={styles.modalOverlay}
+          >
+            <View style={[styles.modalContent, { maxHeight: "90%" }]}>
+              <View style={styles.modalHeader}>
+                <Text style={styles.modalTitle}>Review Order</Text>
+                <TouchableOpacity onPress={() => setShowCheckoutModal(false)}>
+                  <Ionicons
+                    name="close-circle"
+                    size={28}
+                    color={THEME.textSecondary}
+                  />
+                </TouchableOpacity>
+              </View>
+
+              <ScrollView showsVerticalScrollIndicator={false}>
+                <Text style={styles.sectionHeader}>Selected Items</Text>
+
+                {orderData.items.map((item) => (
+                  <View key={item.id} style={styles.checkoutItemRow}>
+                    <View style={styles.checkoutItemTop}>
+                      <Text style={styles.checkoutItemName}>
+                        {item.qty}x {item.name}
+                      </Text>
+                      <Text style={styles.checkoutItemPrice}>
+                        ₹{formatPrice(item.price * item.qty)}
+                      </Text>
+                    </View>
+
+                    {/* Individual Item Note */}
+                    <TextInput
+                      style={styles.noteInput}
+                      placeholder={`Add note for ${item.name} (e.g. No onions)`}
+                      placeholderTextColor="#a1a1aa"
+                      value={itemNotes[item.id] || ""}
+                      onChangeText={(text) =>
+                        handleItemNoteChange(item.id, text)
+                      }
+                      maxLength={100}
+                    />
+                  </View>
+                ))}
+
+                <View style={styles.divider} />
+
+                {/* Kitchen / Order Note */}
+                <Text style={[styles.sectionHeader, { marginTop: 10 }]}>
+                  Order Instructions (Optional)
+                </Text>
+                <TextInput
+                  style={[
+                    styles.noteInput,
+                    { height: 80, textAlignVertical: "top" },
+                  ]}
+                  placeholder="Any general requests for the kitchen? (e.g. Make it fast, extra plates)"
+                  placeholderTextColor="#a1a1aa"
+                  value={orderNote}
+                  onChangeText={setOrderNote}
+                  multiline
+                  maxLength={200}
+                />
+              </ScrollView>
+
+              {/* Place Order Footer */}
+              <View style={styles.checkoutModalFooter}>
+                <View
+                  style={{
+                    flexDirection: "row",
+                    justifyContent: "space-between",
+                    marginBottom: 15,
+                  }}
+                >
+                  <Text style={{ fontSize: 18, fontWeight: "bold" }}>
+                    Total
+                  </Text>
+                  <Text
+                    style={{
+                      fontSize: 22,
+                      fontWeight: "900",
+                      color: THEME.primary,
+                    }}
+                  >
+                    ₹{orderData.totalPrice.toFixed(2)}
+                  </Text>
+                </View>
+
+                <TouchableOpacity
+                  style={[
+                    styles.primaryBtn,
+                    {
+                      width: "100%",
+                      flexDirection: "row",
+                      justifyContent: "center",
+                    },
+                  ]}
+                  onPress={placeOrder}
+                  disabled={placingOrder}
+                >
+                  {placingOrder ? (
+                    <ActivityIndicator color="white" />
+                  ) : (
+                    <>
+                      <Ionicons
+                        name="checkmark-circle-outline"
+                        size={22}
+                        color="white"
+                        style={{ marginRight: 8 }}
+                      />
+                      <Text style={styles.primaryBtnText}>
+                        Confirm & Place Order
+                      </Text>
+                    </>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </View>
+          </KeyboardAvoidingView>
+        </Modal>
 
         {/* SUCCESS MODAL */}
         <Modal visible={showSuccessModal} animationType="fade" transparent>
@@ -1213,7 +1376,7 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "center",
+    justifycontent: "center",
   },
 
   // Tab Bar
@@ -1307,6 +1470,44 @@ const styles = StyleSheet.create({
   checkoutText: { color: "white", fontWeight: "700" },
   checkoutPrice: { color: "white", fontWeight: "800", fontSize: 17 },
 
+  // Checkout Modal Styles
+  checkoutItemRow: {
+    marginBottom: 15,
+    paddingBottom: 15,
+    borderBottomWidth: 1,
+    borderColor: "#f0f0f0",
+  },
+  checkoutItemTop: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginBottom: 8,
+  },
+  checkoutItemName: {
+    fontWeight: "bold",
+    fontSize: 16,
+    color: THEME.textPrimary,
+  },
+  checkoutItemPrice: {
+    fontWeight: "bold",
+    fontSize: 16,
+    color: THEME.textPrimary,
+  },
+  noteInput: {
+    backgroundColor: "#f8fafc",
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    borderRadius: 8,
+    padding: 10,
+    fontSize: 13,
+    color: THEME.textPrimary,
+  },
+  checkoutModalFooter: {
+    marginTop: 20,
+    paddingTop: 15,
+    borderTopWidth: 1,
+    borderColor: "#eee",
+  },
+
   // Inline Orders Tab Styles
   orderRow: {
     flexDirection: "row",
@@ -1339,7 +1540,27 @@ const styles = StyleSheet.create({
     color: THEME.textPrimary,
   },
   receiptItemQty: { fontSize: 12, color: THEME.textSecondary },
+  receiptItemNote: {
+    fontSize: 11,
+    color: THEME.danger,
+    fontStyle: "italic",
+    marginTop: 2,
+  },
   receiptItemPrice: { fontWeight: "600", fontSize: 14 },
+  receiptOrderNote: {
+    backgroundColor: "#f8fafc",
+    padding: 8,
+    borderRadius: 6,
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: 5,
+  },
+  receiptOrderNoteText: {
+    fontSize: 12,
+    color: THEME.textSecondary,
+    fontStyle: "italic",
+    marginLeft: 5,
+  },
   divider: { height: 1, backgroundColor: "#EFEFEF", marginVertical: 10 },
   receiptTotalLabel: { fontSize: 16, fontWeight: "bold" },
   receiptTotalValue: { fontSize: 16, fontWeight: "bold", color: THEME.primary },
@@ -1431,7 +1652,7 @@ const styles = StyleSheet.create({
   },
   viewStatusBtnText: { color: "white", fontWeight: "bold", fontSize: 16 },
 
-  // Bottom Modals (Host Requests)
+  // Bottom Modals
   modalOverlay: {
     flex: 1,
     backgroundColor: "rgba(0,0,0,0.5)",
@@ -1442,7 +1663,6 @@ const styles = StyleSheet.create({
     borderTopLeftRadius: 24,
     borderTopRightRadius: 24,
     padding: 24,
-    maxHeight: "85%",
   },
   modalHeader: {
     flexDirection: "row",
